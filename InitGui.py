@@ -8,11 +8,23 @@ those will be added as the corresponding features land.
 
 import os
 
+import FreeCAD as App
 import FreeCADGui as Gui
 
+# __file__ is not reliably defined when FreeCAD loads InitGui.py (depends on
+# how the addon is loaded), so the icon path is derived from the user's Mod
+# directory instead of the module's own location.
 _ICON_PATH = os.path.join(
-    os.path.dirname(__file__), "atpd", "resources", "icons", "atpd_workbench.svg"
+    App.getUserAppDataDir(),
+    "Mod",
+    "ATPD",
+    "atpd",
+    "resources",
+    "icons",
+    "atpd_workbench.svg",
 )
+if not os.path.isfile(_ICON_PATH):
+    _ICON_PATH = ""
 
 
 class ATPDWorkbench(Gui.Workbench):
