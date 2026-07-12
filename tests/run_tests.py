@@ -16,6 +16,8 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+_REFERENCE_FILES_DIR = os.path.join(_REPO_ROOT, "tests", "files")
+
 import FreeCAD as App  # noqa: E402
 
 
@@ -27,10 +29,19 @@ def test_atpd_module_imports():
 
 
 def test_document_loads_without_error():
-    """A fresh FreeCAD document must be created and closed without error."""
-    doc = App.newDocument("atpd_test_doc")
-    assert doc is not None
-    App.closeDocument(doc.Name)
+    """Each of the 5 reference .FCStd files must open and close without error."""
+    fcstd_files = sorted(
+        name for name in os.listdir(_REFERENCE_FILES_DIR) if name.endswith(".FCStd")
+    )
+    assert len(fcstd_files) == 5, (
+        f"expected 5 reference .FCStd files in {_REFERENCE_FILES_DIR}, "
+        f"found {len(fcstd_files)}: {fcstd_files}"
+    )
+    for filename in fcstd_files:
+        path = os.path.join(_REFERENCE_FILES_DIR, filename)
+        doc = App.openDocument(path)
+        assert doc is not None, f"failed to open {filename}"
+        App.closeDocument(doc.Name)
 
 
 def _collect_tests():
