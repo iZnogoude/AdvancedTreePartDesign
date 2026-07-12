@@ -6,25 +6,7 @@ deliberately minimal for M0: no commands or toolbars are registered yet,
 those will be added as the corresponding features land.
 """
 
-import os
-
-import FreeCAD as App
 import FreeCADGui as Gui
-
-# __file__ is not reliably defined when FreeCAD loads InitGui.py (depends on
-# how the addon is loaded), so the icon path is derived from the user's Mod
-# directory instead of the module's own location.
-_ICON_PATH = os.path.join(
-    App.getUserAppDataDir(),
-    "Mod",
-    "ATPD",
-    "atpd",
-    "resources",
-    "icons",
-    "atpd_workbench.svg",
-)
-if not os.path.isfile(_ICON_PATH):
-    _ICON_PATH = ""
 
 
 class ATPDWorkbench(Gui.Workbench):
@@ -32,7 +14,11 @@ class ATPDWorkbench(Gui.Workbench):
 
     MenuText = "Advanced Tree Part Design"
     ToolTip = "Advanced Tree Part Design workbench"
-    Icon = _ICON_PATH
+    # No icon yet: the Addon Manager appears to run InitGui.py before
+    # FreeCAD/App is fully initialized, so any icon path computation at
+    # module level is fragile. Real icon loading is deferred to
+    # Initialize() - see the tracking issue for details.
+    Icon = ""
 
     def Initialize(self):
         """Register commands and menus. No-op for now (M0 skeleton)."""
