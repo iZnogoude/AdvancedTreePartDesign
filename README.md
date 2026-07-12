@@ -1,5 +1,7 @@
 # Advanced Tree Part Design (ATPD)
 
+[![Lint](https://github.com/iZnogoude/AdvancedTreePartDesign/actions/workflows/lint.yml/badge.svg)](https://github.com/iZnogoude/AdvancedTreePartDesign/actions/workflows/lint.yml)
+
 > Un atelier FreeCAD qui modernise Part Design : arbre de features à la SolidWorks (états visuels, suppress/unsuppress robuste, barre de reprise) et fonctions de modélisation unifiées à la Onshape (une Extrusion qui fait ajout/retrait/nouveau corps/fonction mince).
 
 **Statut :** 🚧 En développement — Jalon M0 (Fondations)

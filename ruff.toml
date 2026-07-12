@@ -1,0 +1,21 @@
+# Ruff configuration for ATPD.
+# CI (.github/workflows/lint.yml) runs `ruff check` with this config on
+# every Pull Request.
+
+target-version = "py311"
+line-length = 100
+
+[lint]
+select = ["E", "F", "W", "I"]
+# Docstring (D) and TODO/FIXME (TD, FIX) rules are intentionally left
+# disabled: the project is in active early development, TODOs and missing
+# docstrings on private helpers are expected and shouldn't block a PR.
+
+[lint.isort]
+# FreeCAD, FreeCADGui, Part, Sketcher, etc. are injected into the Python
+# environment by FreeCAD itself at runtime - they aren't installable
+# packages, so nothing on this machine (or in CI) can resolve them the way
+# a normal dependency would be. They're still genuinely external to this
+# project, so group them as third-party for import-sorting purposes rather
+# than letting isort misclassify them as first-party/local.
+known-third-party = ["FreeCAD", "FreeCADGui", "Part", "Sketcher", "PySide6"]
