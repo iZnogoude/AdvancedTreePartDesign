@@ -59,6 +59,16 @@ ln -s $(pwd)/AdvancedTreePartDesign ~/.var/app/org.freecad.FreeCAD/data/FreeCAD/
 
 Le projet fonctionne en branches + Pull Requests. Voir [`CLAUDE.md`](CLAUDE.md) pour les conventions de code et le workflow.
 
+### Lancer les tests
+
+Les tests s'exécutent en headless via `FreeCADCmd`. En environnement Flatpak :
+
+```bash
+flatpak run --command=FreeCADCmd org.freecad.FreeCAD tests/run_tests.py
+```
+
+Le script se charge lui-même d'ajouter la racine du repo à `sys.path` — inutile de `cd` dans `tests/`. Un code de sortie non nul indique qu'au moins un test a échoué.
+
 ## Licence
 
 LGPL-2.1+ — voir [`LICENSE`](LICENSE).
