@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no" ?>
+<package format="1" xmlns="https://wiki.freecad.org/Package_Metadata">
+  <name>AdvancedTreePartDesign</name>
+  <description>A workbench that modernizes Part Design: a SolidWorks-like feature tree (visual states, robust suppress/unsuppress, rollback bar) combined with Onshape-style unified modeling functions (a single Extrusion that adds/removes material, creates a new body, or produces a thin feature).</description>
+  <version>0.0.1</version>
+  <date>2026-07-12</date>
+  <maintainer email="iznogoude31@gmail.com">John (iZnogoude)</maintainer>
+  <license file="LICENSE">LGPL-2.1-or-later</license>
+  <url type="repository" branch="main">https://github.com/iZnogoude/AdvancedTreePartDesign</url>
+  <url type="readme">https://github.com/iZnogoude/AdvancedTreePartDesign/blob/main/README.md</url>
+  <url type="bugtracker">https://github.com/iZnogoude/AdvancedTreePartDesign/issues</url>
+
+  <content>
+    <workbench>
+      <classname>ATPDWorkbench</classname>
+      <subdirectory>./</subdirectory>
+      <freecadmin>1.0.0</freecadmin>
+      <tag>partdesign</tag>
+      <tag>tree</tag>
+    </workbench>
+  </content>
+
+</package>
