@@ -53,8 +53,15 @@ def simplify_type_id(type_id: str) -> str:
 
 
 def is_nestable(obj) -> bool:
-    """Sketches and datums nest under their consumer; features never do."""
-    return obj.TypeId == "Sketcher::SketchObject" or obj.TypeId.startswith("Part::Datum")
+    """Only sketches consumed by a feature nest; everything else stays top-level.
+
+    Datums are deliberately excluded, even though a DatumPlane commonly
+    references another DatumPlane (or a feature's face) via
+    AttachmentSupport for its own positioning: that's a geometric anchor,
+    not an ownership relationship, and the native Model tree keeps every
+    datum a direct child of the Body regardless of what it's attached to.
+    """
+    return obj.TypeId == "Sketcher::SketchObject"
 
 
 def feature_state(obj) -> str:
@@ -112,24 +119,14 @@ def _consumer_links(obj) -> list[str]:
     return names
 
 
-def _attachment_support_target(obj) -> str | None:
-    """Name of the object this Sketch/Datum is attached to, if any."""
-    if "AttachmentSupport" not in obj.PropertiesList:
-        return None
-    names = _linked_object_names(obj, "AttachmentSupport")
-    return names[0] if names else None
-
-
 def _resolve_parents(body_objects) -> dict[str, str]:
-    """Map each nestable object's Name to its parent's Name, if any.
+    """Map each nestable (sketch) object's Name to its consumer feature's Name.
 
-    Priority: (1) some other object in the body consumes it via a normal
-    Link property - e.g. Pad.Profile -> Sketch is how the native tree
-    nests a feature's own sketch under that feature. (2) Otherwise, fall
-    back to its own AttachmentSupport target - e.g. a datum plane attached
-    to a face has no consumer, only an anchor, but should still nest
-    under whatever it's attached to (which may itself be another Sketch
-    or datum, several levels deep).
+    A sketch nests under whatever other object in the body references it
+    via a normal "uses" Link property - e.g. Pad.Profile -> Sketch is how
+    the native tree nests a feature's own sketch under that feature. A
+    sketch with no such consumer (unused, or only referenced via
+    AttachmentSupport/ExternalGeometry) stays top-level.
     """
     by_name = {obj.Name: obj for obj in body_objects}
     parent_of: dict[str, str] = {}
@@ -141,13 +138,6 @@ def _resolve_parents(body_objects) -> dict[str, str]:
             target = by_name[target_name]
             if is_nestable(target) and target_name not in parent_of:
                 parent_of[target_name] = obj.Name
-
-    for obj in body_objects:
-        if not is_nestable(obj) or obj.Name in parent_of:
-            continue
-        target_name = _attachment_support_target(obj)
-        if target_name and target_name in by_name and target_name != obj.Name:
-            parent_of[obj.Name] = target_name
 
     return parent_of
 
@@ -161,9 +151,9 @@ def collect_body_features(body) -> list[FeatureRow]:
     """Build the hierarchical feature tree for a PartDesign Body.
 
     Top-level features (Pad, Pocket, Fillet, ...) keep the Body.Group /
-    Tip order. Sketches and datums are nested under whichever object
-    consumes them (see _resolve_parents) - never guessed from names, only
-    from real Link/LinkSub properties.
+    Tip order, as do datums - only sketches nest, and only under whatever
+    consumes them as a profile/section/spine (see _resolve_parents),
+    never guessed from names, only from real Link/LinkSub properties.
     """
     objects = list(body.Group)
     parent_of = _resolve_parents(objects)

@@ -3,10 +3,10 @@
 QTreeWidget rather than QTreeView + a custom QAbstractItemModel: M1 has
 no drag-drop, editing, or lazy loading, so the extra model/view
 machinery isn't earning its keep yet - QTreeWidgetItem nesting is enough
-to show sketches/datums under their consumer feature. The Qt-free data
-layer (model.py) is already factored out, so upgrading to a real item
-model later - needed once M2 adds interaction - won't require touching
-that layer.
+to show a consumed sketch under the feature that uses it. The Qt-free
+data layer (model.py) is already factored out, so upgrading to a real
+item model later - needed once M2 adds interaction - won't require
+touching that layer.
 """
 
 import FreeCAD as App

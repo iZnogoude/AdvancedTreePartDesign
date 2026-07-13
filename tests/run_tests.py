@@ -71,13 +71,16 @@ def test_tree_model_matches_body_group():
 
 
 def test_tree_hierarchy_cross_deps_and_sweep_loft():
-    """Sketches/datums must nest under their real consumer, not by guesswork.
+    """Only sketches consumed by a feature nest - datums never do.
 
-    03_cross_deps.FCStd has sketches attached to faces of other pads;
-    04_sweep_loft.FCStd has a datum plane nested two levels deep under
-    another datum plane, itself under a feature via AttachmentSupport.
-    Both are verified against the exact Link/LinkSub properties (checked
-    directly against the .FCStd files, not guessed from names).
+    03_cross_deps.FCStd has sketches attached to faces of other pads
+    (must nest under the feature that consumes them as a Profile, not
+    under the pad they're attached to). 04_sweep_loft.FCStd has a datum
+    plane referencing another datum plane via AttachmentSupport purely
+    for positioning - both must stay direct, top-level children of the
+    Body, not nested under one another. Verified against the exact
+    Link/LinkSub properties (checked directly against the .FCStd files,
+    not guessed from names).
     """
     from atpd.tree.model import collect_body_features
 
@@ -103,14 +106,12 @@ def test_tree_hierarchy_cross_deps_and_sweep_loft():
             },
         },
         "04_sweep_loft.FCStd": {
-            "top_level": {"AdditivePipe", "AdditiveLoft"},
+            "top_level": {"AdditivePipe", "AdditiveLoft", "DatumPlane", "DatumPlane001"},
             "parents": {
                 "Sketch": "AdditivePipe",
                 "Sketch001": "AdditivePipe",
                 "Sketch002": "AdditiveLoft",
-                "DatumPlane": "AdditivePipe",
                 "Sketch003": "AdditiveLoft",
-                "DatumPlane001": "DatumPlane",
                 "Sketch004": "AdditiveLoft",
             },
         },
