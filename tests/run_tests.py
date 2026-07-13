@@ -44,6 +44,27 @@ def test_document_loads_without_error():
         App.closeDocument(doc.Name)
 
 
+def test_tree_model_matches_body_group():
+    """collect_body_features() must list every object in each reference Body."""
+    from atpd.tree.model import collect_body_features
+
+    fcstd_files = sorted(
+        name for name in os.listdir(_REFERENCE_FILES_DIR) if name.endswith(".FCStd")
+    )
+    for filename in fcstd_files:
+        path = os.path.join(_REFERENCE_FILES_DIR, filename)
+        doc = App.openDocument(path)
+        bodies = [obj for obj in doc.Objects if obj.TypeId == "PartDesign::Body"]
+        assert bodies, f"no PartDesign Body found in {filename}"
+        for body in bodies:
+            rows = collect_body_features(body)
+            assert len(rows) == len(body.Group), (
+                f"{filename}: tree model has {len(rows)} rows, "
+                f"Body.Group has {len(body.Group)}"
+            )
+        App.closeDocument(doc.Name)
+
+
 def _collect_tests():
     module = sys.modules[__name__]
     return [
