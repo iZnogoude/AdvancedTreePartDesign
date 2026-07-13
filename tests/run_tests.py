@@ -45,8 +45,13 @@ def test_document_loads_without_error():
 
 
 def test_tree_model_matches_body_group():
-    """collect_body_features() must list every object in each reference Body."""
-    from atpd.tree.model import collect_body_features
+    """collect_body_features() must account for every object in each Body.
+
+    The model is hierarchical (sketches/datums nest under their consumer
+    feature), so the row count that must match Body.Group is the total
+    across all nesting levels, not just the top-level rows.
+    """
+    from atpd.tree.model import collect_body_features, count_rows
 
     fcstd_files = sorted(
         name for name in os.listdir(_REFERENCE_FILES_DIR) if name.endswith(".FCStd")
@@ -57,11 +62,79 @@ def test_tree_model_matches_body_group():
         bodies = [obj for obj in doc.Objects if obj.TypeId == "PartDesign::Body"]
         assert bodies, f"no PartDesign Body found in {filename}"
         for body in bodies:
-            rows = collect_body_features(body)
-            assert len(rows) == len(body.Group), (
-                f"{filename}: tree model has {len(rows)} rows, "
+            total = count_rows(collect_body_features(body))
+            assert total == len(body.Group), (
+                f"{filename}: tree model has {total} total rows, "
                 f"Body.Group has {len(body.Group)}"
             )
+        App.closeDocument(doc.Name)
+
+
+def test_tree_hierarchy_cross_deps_and_sweep_loft():
+    """Sketches/datums must nest under their real consumer, not by guesswork.
+
+    03_cross_deps.FCStd has sketches attached to faces of other pads;
+    04_sweep_loft.FCStd has a datum plane nested two levels deep under
+    another datum plane, itself under a feature via AttachmentSupport.
+    Both are verified against the exact Link/LinkSub properties (checked
+    directly against the .FCStd files, not guessed from names).
+    """
+    from atpd.tree.model import collect_body_features
+
+    def build_parent_map(rows, parent_name=None, mapping=None):
+        if mapping is None:
+            mapping = {}
+        for row in rows:
+            if parent_name is not None:
+                mapping[row.name] = parent_name
+            build_parent_map(row.children, row.name, mapping)
+        return mapping
+
+    expectations = {
+        "03_cross_deps.FCStd": {
+            "top_level": {"Pad", "Pad001", "Pad002", "Pad003", "Pad004", "Pad005", "Pocket"},
+            "parents": {
+                "Sketch": "Pad",
+                "Sketch001": "Pad001",
+                "Sketch002": "Pad003",
+                "Sketch003": "Pad004",
+                "Sketch004": "Pad005",
+                "Sketch005": "Pocket",
+            },
+        },
+        "04_sweep_loft.FCStd": {
+            "top_level": {"AdditivePipe", "AdditiveLoft"},
+            "parents": {
+                "Sketch": "AdditivePipe",
+                "Sketch001": "AdditivePipe",
+                "Sketch002": "AdditiveLoft",
+                "DatumPlane": "AdditivePipe",
+                "Sketch003": "AdditiveLoft",
+                "DatumPlane001": "DatumPlane",
+                "Sketch004": "AdditiveLoft",
+            },
+        },
+    }
+
+    for filename, expected in expectations.items():
+        path = os.path.join(_REFERENCE_FILES_DIR, filename)
+        doc = App.openDocument(path)
+        body = next(obj for obj in doc.Objects if obj.TypeId == "PartDesign::Body")
+        rows = collect_body_features(body)
+
+        top_level_names = {row.name for row in rows}
+        assert top_level_names == expected["top_level"], (
+            f"{filename}: top-level names {top_level_names} != {expected['top_level']}"
+        )
+
+        parent_map = build_parent_map(rows)
+        for child_name, expected_parent in expected["parents"].items():
+            actual_parent = parent_map.get(child_name)
+            assert actual_parent == expected_parent, (
+                f"{filename}: parent of {child_name} is {actual_parent!r}, "
+                f"expected {expected_parent!r}"
+            )
+
         App.closeDocument(doc.Name)
 
 
