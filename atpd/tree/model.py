@@ -178,3 +178,42 @@ def collect_body_features(body) -> list[FeatureRow]:
             top_level.append(row)
 
     return top_level
+
+
+def find_dependents(obj) -> list:
+    """Other document objects that reference obj, excluding its own Body.
+
+    obj.InList always includes the Body (via its Group property), which
+    isn't a meaningful "this depends on obj" relationship for a suppress
+    warning, so it's filtered out. InList can also list the same object
+    more than once when it references obj through several properties
+    (e.g. both AttachmentSupport and ExternalGeometry), so results are
+    deduped, preserving order.
+    """
+    seen = set()
+    dependents = []
+    for other in obj.InList:
+        if other.TypeId == "PartDesign::Body" or other.Name in seen:
+            continue
+        seen.add(other.Name)
+        dependents.append(other)
+    return dependents
+
+
+def toggle_suppressed(doc, obj) -> bool:
+    """Flip obj.Suppressed inside a transaction and recompute. Returns the new value.
+
+    The transaction is committed only if both the property change and the
+    recompute succeed; any exception aborts it first, so the document is
+    never left half-changed, then re-raises for the caller to report.
+    """
+    new_value = not obj.Suppressed
+    doc.openTransaction(f"{'Suppress' if new_value else 'Unsuppress'} {obj.Label}")
+    try:
+        obj.Suppressed = new_value
+        doc.recompute()
+    except Exception:
+        doc.abortTransaction()
+        raise
+    doc.commitTransaction()
+    return new_value
