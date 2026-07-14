@@ -217,3 +217,27 @@ def toggle_suppressed(doc, obj) -> bool:
         raise
     doc.commitTransaction()
     return new_value
+
+
+def rename_label(doc, obj, new_label: str) -> bool:
+    """Set obj.Label (never obj.Name, the immutable internal identifier)
+    inside a transaction. Returns whether it was actually applied.
+
+    Blank/whitespace-only input is rejected (the caller should restore
+    the displayed text). FreeCAD's own Label setter already resolves
+    duplicates by auto-appending a numeric suffix when another object in
+    the document already has that exact Label (verified empirically -
+    the Label property is not a simple pass-through), so no separate
+    uniqueness check is needed here.
+    """
+    new_label = new_label.strip()
+    if not new_label or new_label == obj.Label:
+        return False
+    doc.openTransaction(f"Rename {obj.Label} to {new_label}")
+    try:
+        obj.Label = new_label
+    except Exception:
+        doc.abortTransaction()
+        raise
+    doc.commitTransaction()
+    return True
