@@ -1,19 +1,30 @@
-"""Read-only QDockWidget showing the active Body's feature tree (M1).
+"""QDockWidget showing the active Body's feature tree, with suppress toggling.
 
-QTreeWidget rather than QTreeView + a custom QAbstractItemModel: M1 has
-no drag-drop, editing, or lazy loading, so the extra model/view
-machinery isn't earning its keep yet - QTreeWidgetItem nesting is enough
-to show a consumed sketch under the feature that uses it. The Qt-free
-data layer (model.py) is already factored out, so upgrading to a real
-item model later - needed once M2 adds interaction - won't require
-touching that layer.
+QTreeWidget rather than QTreeView + a custom QAbstractItemModel: there's
+still no drag-drop or lazy loading, so the extra model/view machinery
+isn't earning its keep yet - QTreeWidgetItem nesting is enough to show a
+consumed sketch under the feature that uses it, and item flags/data are
+enough for the M2 suppress/unsuppress interaction added here. The
+Qt-free data layer (model.py) is already factored out, so upgrading to
+a real item model later - if drag-drop reordering needs it - won't
+require touching that layer.
 """
 
 import FreeCAD as App
 import FreeCADGui as Gui
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .model import ERROR, SUPPRESSED, FeatureRow, collect_body_features, count_rows
+from .model import (
+    ERROR,
+    SUPPRESSED,
+    FeatureRow,
+    collect_body_features,
+    count_rows,
+    find_dependents,
+    toggle_suppressed,
+)
+
+_NAME_ROLE = QtCore.Qt.ItemDataRole.UserRole
 
 
 def _active_body():
@@ -73,18 +84,16 @@ def _make_item(row: FeatureRow) -> QtWidgets.QTreeWidgetItem:
     item = QtWidgets.QTreeWidgetItem([row.label, row.type_id])
     item.setToolTip(0, row.label)
     item.setToolTip(1, row.type_id)
+    item.setData(0, _NAME_ROLE, row.name)
 
     if row.state == SUPPRESSED:
         # Never hardcode a color: a gray that reads fine in a light theme
-        # can be unreadable in a dark one, and a plain setForeground() can
-        # also get overridden by a theme's stylesheet. Disabling the item
-        # lets Qt's style engine dim it using the *current* palette on
-        # its own, and explicitly reading the palette's disabled-text
-        # role as a backup covers styles that don't dim disabled items
-        # much. The tree is read-only in M1 anyway, so losing
-        # selectability costs nothing yet - revisit if M2 needs to select
-        # a suppressed row (e.g. to unsuppress it).
-        item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEnabled)
+        # can be unreadable in a dark one. Read the *current* palette's
+        # disabled-text color instead - theme-safe without hardcoding
+        # anything. This item deliberately keeps Qt.ItemFlag.ItemIsEnabled
+        # set (unlike the M1 version): suppressed rows must stay
+        # double-clickable/right-clickable so they can be unsuppressed
+        # from here.
         disabled_text = QtWidgets.QApplication.palette().color(
             QtGui.QPalette.ColorGroup.Disabled, QtGui.QPalette.ColorRole.Text
         )
@@ -105,7 +114,11 @@ def _make_item(row: FeatureRow) -> QtWidgets.QTreeWidgetItem:
 
 
 class FeatureTreePanel(QtWidgets.QDockWidget):
-    """Dockable, read-only view of the active Body's feature chain."""
+    """Dockable view of the active Body's feature chain.
+
+    Read-only display plus one interaction: double-click or right-click a
+    feature to suppress/unsuppress it.
+    """
 
     def __init__(self, parent=None):
         super().__init__("ATPD - Feature Tree", parent)
@@ -114,6 +127,9 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
         self._tree = QtWidgets.QTreeWidget(self)
         self._tree.setColumnCount(2)
         self._tree.setHeaderLabels(["Feature", "Type"])
+        self._tree.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self._tree.customContextMenuRequested.connect(self._on_context_menu)
+        self._tree.itemDoubleClicked.connect(self._on_item_double_clicked)
         self.setWidget(self._tree)
 
         self._observer = _TreeDocumentObserver(self.refresh)
@@ -144,3 +160,71 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
     def closeEvent(self, event: QtCore.QEvent) -> None:
         Gui.removeDocumentObserver(self._observer)
         super().closeEvent(event)
+
+    def _resolve_object(self, item: QtWidgets.QTreeWidgetItem):
+        """The live FreeCAD object an item represents, or None."""
+        name = item.data(0, _NAME_ROLE)
+        doc = App.ActiveDocument
+        if doc is None or not name:
+            return None
+        return doc.getObject(name)
+
+    def _on_item_double_clicked(self, item: QtWidgets.QTreeWidgetItem, column: int) -> None:
+        self._try_toggle_suppress(item)
+
+    def _on_context_menu(self, pos: QtCore.QPoint) -> None:
+        item = self._tree.itemAt(pos)
+        obj = self._resolve_object(item) if item is not None else None
+        if obj is None or not hasattr(obj, "Suppressed"):
+            return
+
+        menu = QtWidgets.QMenu(self._tree)
+        label = "Unsuppress" if obj.Suppressed else "Suppress"
+        action = menu.addAction(label)
+        chosen = menu.exec(self._tree.viewport().mapToGlobal(pos))
+        if chosen is action:
+            self._toggle_suppress(obj)
+
+    def _try_toggle_suppress(self, item: QtWidgets.QTreeWidgetItem) -> None:
+        obj = self._resolve_object(item)
+        if obj is None or not hasattr(obj, "Suppressed"):
+            App.Console.PrintMessage(
+                "ATPD tree DEBUG: double-click on a non-suppressible item, ignored\n"
+            )
+            return
+        self._toggle_suppress(obj)
+
+    def _toggle_suppress(self, obj) -> None:
+        """Suppress/unsuppress obj, warning about dependents first if any."""
+        action = "unsuppress" if obj.Suppressed else "suppress"
+        dependents = find_dependents(obj)
+        App.Console.PrintMessage(
+            f"ATPD tree DEBUG: {action} requested for {obj.Name}, "
+            f"{len(dependents)} dependent(s)\n"
+        )
+
+        if dependents:
+            names = ", ".join(dep.Label for dep in dependents)
+            reply = QtWidgets.QMessageBox.question(
+                self,
+                f"Confirm {action}",
+                f'"{obj.Label}" has {len(dependents)} dependent feature(s) that may be '
+                f"affected: {names}.\n\nContinue?",
+                QtWidgets.QMessageBox.StandardButton.Ok
+                | QtWidgets.QMessageBox.StandardButton.Cancel,
+            )
+            if reply != QtWidgets.QMessageBox.StandardButton.Ok:
+                App.Console.PrintMessage(f"ATPD tree DEBUG: {action} cancelled by user\n")
+                return
+
+        try:
+            new_value = toggle_suppressed(obj.Document, obj)
+        except Exception as exc:
+            App.Console.PrintError(f"ATPD tree: failed to {action} {obj.Name}: {exc}\n")
+            QtWidgets.QMessageBox.critical(
+                self, "Error", f'Failed to {action} "{obj.Label}":\n{exc}'
+            )
+            return
+
+        App.Console.PrintMessage(f"ATPD tree DEBUG: {obj.Name}.Suppressed -> {new_value}\n")
+        self.refresh()

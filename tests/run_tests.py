@@ -185,6 +185,50 @@ def test_suppress_state_reflected_in_model():
     assert os.path.getmtime(src) == mtime_before, "reference file must never be modified"
 
 
+def test_suppress_dependents_and_transaction():
+    """find_dependents() must surface real dependents, and toggle_suppressed()
+    must flip Suppressed inside a transaction and be reversible.
+
+    Uses 03_cross_deps.FCStd, whose Pad001 has a real downstream
+    dependent (Pad002 references Pad001's edges directly, not through a
+    sketch) - exactly the interactive-suppress warning scenario. Mutates
+    a temp-directory copy, never the reference file itself; the
+    reference file's mtime is asserted unchanged at the end.
+    """
+    from atpd.tree.model import find_dependents, toggle_suppressed
+
+    src = os.path.join(_REFERENCE_FILES_DIR, "03_cross_deps.FCStd")
+    mtime_before = os.path.getmtime(src)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        copy_path = os.path.join(tmp_dir, "03_cross_deps_copy.FCStd")
+        shutil.copyfile(src, copy_path)
+
+        doc = App.openDocument(copy_path)
+        try:
+            target = doc.getObject("Pad001")
+            assert target is not None, "Pad001 not found in the reference copy"
+
+            dependent_names = {dep.Name for dep in find_dependents(target)}
+            assert "Pad002" in dependent_names, (
+                f"expected Pad002 among Pad001's dependents, got {dependent_names}"
+            )
+
+            assert target.Suppressed is False
+
+            new_value = toggle_suppressed(doc, target)
+            assert new_value is True
+            assert target.Suppressed is True
+
+            restored_value = toggle_suppressed(doc, target)
+            assert restored_value is False
+            assert target.Suppressed is False
+        finally:
+            App.closeDocument(doc.Name)
+
+    assert os.path.getmtime(src) == mtime_before, "reference file must never be modified"
+
+
 def _collect_tests():
     module = sys.modules[__name__]
     return [
