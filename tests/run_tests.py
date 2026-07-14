@@ -10,7 +10,9 @@ Usage:
 """
 
 import os
+import shutil
 import sys
+import tempfile
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
@@ -137,6 +139,50 @@ def test_tree_hierarchy_cross_deps_and_sweep_loft():
             )
 
         App.closeDocument(doc.Name)
+
+
+def test_suppress_state_reflected_in_model():
+    """Suppressing a feature must flip its FeatureRow.state to "suppressed".
+
+    Mutates a temp-directory copy of 04_sweep_loft.FCStd, never the
+    reference file itself - the reference file's mtime is asserted
+    unchanged at the end as a hard guarantee, on top of Suppressed being
+    restored to False before the copy is closed.
+    """
+    from atpd.tree.model import SUPPRESSED, collect_body_features
+
+    src = os.path.join(_REFERENCE_FILES_DIR, "04_sweep_loft.FCStd")
+    mtime_before = os.path.getmtime(src)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        copy_path = os.path.join(tmp_dir, "04_sweep_loft_copy.FCStd")
+        shutil.copyfile(src, copy_path)
+
+        doc = App.openDocument(copy_path)
+        try:
+            body = next(obj for obj in doc.Objects if obj.TypeId == "PartDesign::Body")
+            target = doc.getObject("AdditivePipe")
+            assert target is not None, "AdditivePipe not found in the reference copy"
+
+            rows_before = {row.name: row for row in collect_body_features(body)}
+            assert rows_before["AdditivePipe"].state != SUPPRESSED, (
+                "AdditivePipe should not start suppressed"
+            )
+
+            target.Suppressed = True
+            doc.recompute()
+
+            rows_after = {row.name: row for row in collect_body_features(body)}
+            assert rows_after["AdditivePipe"].state == SUPPRESSED, (
+                f"expected suppressed, got {rows_after['AdditivePipe'].state!r}"
+            )
+
+            target.Suppressed = False
+            doc.recompute()
+        finally:
+            App.closeDocument(doc.Name)
+
+    assert os.path.getmtime(src) == mtime_before, "reference file must never be modified"
 
 
 def _collect_tests():
