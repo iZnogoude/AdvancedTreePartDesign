@@ -21,6 +21,7 @@ from .model import (
     collect_body_features,
     count_rows,
     find_dependents,
+    rename_label,
     toggle_suppressed,
 )
 
@@ -85,6 +86,11 @@ def _make_item(row: FeatureRow) -> QtWidgets.QTreeWidgetItem:
     item.setToolTip(0, row.label)
     item.setToolTip(1, row.type_id)
     item.setData(0, _NAME_ROLE, row.name)
+    # Qt.ItemIsEditable is per-item, not per-column - it also technically
+    # makes the Type column editable. _on_item_changed() below only ever
+    # acts on column 0, so editing column 1 is a harmless no-op that the
+    # next refresh() silently overwrites back to the real type.
+    item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsEditable)
 
     if row.state == SUPPRESSED:
         # Never hardcode a color: a gray that reads fine in a light theme
@@ -116,8 +122,9 @@ def _make_item(row: FeatureRow) -> QtWidgets.QTreeWidgetItem:
 class FeatureTreePanel(QtWidgets.QDockWidget):
     """Dockable view of the active Body's feature chain.
 
-    Read-only display plus one interaction: double-click or right-click a
-    feature to suppress/unsuppress it.
+    Read-only display plus a few interactions:
+    - double-click or right-click a feature to suppress/unsuppress it
+    - F2, or clicking an already-selected feature, to rename it inline
     """
 
     def __init__(self, parent=None):
@@ -130,6 +137,15 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
         self._tree.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self._tree.customContextMenuRequested.connect(self._on_context_menu)
         self._tree.itemDoubleClicked.connect(self._on_item_double_clicked)
+        # EditKeyPressed = F2. SelectedClicked = clicking an item that is
+        # already selected, same convention native file explorers use for
+        # rename - deliberately *not* DoubleClicked, which already means
+        # suppress/unsuppress here (see _on_item_double_clicked).
+        self._tree.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.EditKeyPressed
+            | QtWidgets.QAbstractItemView.EditTrigger.SelectedClicked
+        )
+        self._tree.itemChanged.connect(self._on_item_changed)
         self.setWidget(self._tree)
 
         self._observer = _TreeDocumentObserver(self.refresh)
@@ -141,21 +157,30 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
     def refresh(self):
         """Rebuild the tree from the currently active Body, if any."""
         App.Console.PrintMessage("ATPD tree DEBUG: refresh() called\n")
-        self._tree.clear()
-        body = _active_body()
-        if body is None:
-            App.Console.PrintMessage("ATPD tree DEBUG: refresh() found no body, tree left empty\n")
-            return
-        rows = collect_body_features(body)
-        App.Console.PrintMessage(
-            f"ATPD tree DEBUG: refresh() got {len(rows)} top-level row(s), "
-            f"{count_rows(rows)} total (incl. nested) from body {body.Name}\n"
-        )
-        for row in rows:
-            self._tree.addTopLevelItem(_make_item(row))
-        self._tree.expandAll()
-        self._tree.resizeColumnToContents(0)
-        self._tree.resizeColumnToContents(1)
+        # Rebuilding the tree calls addTopLevelItem()/setText() on items
+        # that aren't user edits - block itemChanged while doing it so
+        # _on_item_changed() never mistakes a rebuild for a rename.
+        self._tree.blockSignals(True)
+        try:
+            self._tree.clear()
+            body = _active_body()
+            if body is None:
+                App.Console.PrintMessage(
+                    "ATPD tree DEBUG: refresh() found no body, tree left empty\n"
+                )
+                return
+            rows = collect_body_features(body)
+            App.Console.PrintMessage(
+                f"ATPD tree DEBUG: refresh() got {len(rows)} top-level row(s), "
+                f"{count_rows(rows)} total (incl. nested) from body {body.Name}\n"
+            )
+            for row in rows:
+                self._tree.addTopLevelItem(_make_item(row))
+            self._tree.expandAll()
+            self._tree.resizeColumnToContents(0)
+            self._tree.resizeColumnToContents(1)
+        finally:
+            self._tree.blockSignals(False)
 
     def closeEvent(self, event: QtCore.QEvent) -> None:
         Gui.removeDocumentObserver(self._observer)
@@ -228,3 +253,37 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
 
         App.Console.PrintMessage(f"ATPD tree DEBUG: {obj.Name}.Suppressed -> {new_value}\n")
         self.refresh()
+
+    def _on_item_changed(self, item: QtWidgets.QTreeWidgetItem, column: int) -> None:
+        """Apply an inline-edited label to the real object, or restore it.
+
+        Enter commits the edit (firing this), Escape cancels it without
+        firing anything - both handled by Qt's built-in item editor, no
+        custom keyPressEvent needed here.
+        """
+        if column != 0:
+            return
+        obj = self._resolve_object(item)
+        if obj is None:
+            return
+
+        new_text = item.text(0)
+        try:
+            applied = rename_label(obj.Document, obj, new_text)
+        except Exception as exc:
+            App.Console.PrintError(f"ATPD tree: failed to rename {obj.Name}: {exc}\n")
+            QtWidgets.QMessageBox.critical(
+                self, "Error", f'Failed to rename "{obj.Label}":\n{exc}'
+            )
+            item.setText(0, obj.Label)
+            return
+
+        if applied:
+            App.Console.PrintMessage(f"ATPD tree DEBUG: {obj.Name}.Label -> {obj.Label!r}\n")
+            self.refresh()
+        else:
+            App.Console.PrintMessage(
+                f"ATPD tree DEBUG: rename of {obj.Name} rejected (blank or unchanged), "
+                f"restoring {obj.Label!r}\n"
+            )
+            item.setText(0, obj.Label)

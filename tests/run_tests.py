@@ -229,6 +229,54 @@ def test_suppress_dependents_and_transaction():
     assert os.path.getmtime(src) == mtime_before, "reference file must never be modified"
 
 
+def test_rename_label():
+    """rename_label() must only ever touch Label, reject blank input, and
+    leave FreeCAD's own duplicate-Label auto-disambiguation alone.
+
+    Uses a temp-directory copy of 01_simple.FCStd, never the reference
+    file itself; its mtime is asserted unchanged at the end.
+    """
+    from atpd.tree.model import rename_label
+
+    src = os.path.join(_REFERENCE_FILES_DIR, "01_simple.FCStd")
+    mtime_before = os.path.getmtime(src)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        copy_path = os.path.join(tmp_dir, "01_simple_copy.FCStd")
+        shutil.copyfile(src, copy_path)
+
+        doc = App.openDocument(copy_path)
+        try:
+            pad = doc.getObject("Pad")
+            fillet = doc.getObject("Fillet")
+            assert pad is not None and fillet is not None
+            original_name = pad.Name
+
+            applied = rename_label(doc, pad, "My Renamed Pad")
+            assert applied is True
+            assert pad.Label == "My Renamed Pad"
+            assert pad.Name == original_name, "Name (internal id) must never change"
+
+            applied_blank = rename_label(doc, pad, "   ")
+            assert applied_blank is False, "blank input must be rejected"
+            assert pad.Label == "My Renamed Pad", "label must be unchanged after a rejected rename"
+
+            # FreeCAD auto-disambiguates duplicate labels by appending a
+            # suffix rather than erroring or silently overwriting - this
+            # must keep working, not something rename_label() needs to
+            # prevent itself.
+            applied_dup = rename_label(doc, pad, fillet.Label)
+            assert applied_dup is True
+            assert pad.Label != fillet.Label, (
+                f"expected FreeCAD to auto-disambiguate, got matching labels {pad.Label!r}"
+            )
+            assert pad.Label.startswith(fillet.Label)
+        finally:
+            App.closeDocument(doc.Name)
+
+    assert os.path.getmtime(src) == mtime_before, "reference file must never be modified"
+
+
 def _collect_tests():
     module = sys.modules[__name__]
     return [
