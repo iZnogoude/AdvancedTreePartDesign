@@ -13,13 +13,7 @@ import FreeCAD as App
 import FreeCADGui as Gui
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .model import ACTIVE, ERROR, SUPPRESSED, FeatureRow, collect_body_features, count_rows
-
-_STATE_COLORS = {
-    ACTIVE: None,
-    SUPPRESSED: QtGui.QColor("gray"),
-    ERROR: QtGui.QColor("red"),
-}
+from .model import ERROR, SUPPRESSED, FeatureRow, collect_body_features, count_rows
 
 
 def _active_body():
@@ -79,10 +73,32 @@ def _make_item(row: FeatureRow) -> QtWidgets.QTreeWidgetItem:
     item = QtWidgets.QTreeWidgetItem([row.label, row.type_id])
     item.setToolTip(0, row.label)
     item.setToolTip(1, row.type_id)
-    color = _STATE_COLORS.get(row.state)
-    if color is not None:
-        item.setForeground(0, color)
-        item.setForeground(1, color)
+
+    if row.state == SUPPRESSED:
+        # Never hardcode a color: a gray that reads fine in a light theme
+        # can be unreadable in a dark one, and a plain setForeground() can
+        # also get overridden by a theme's stylesheet. Disabling the item
+        # lets Qt's style engine dim it using the *current* palette on
+        # its own, and explicitly reading the palette's disabled-text
+        # role as a backup covers styles that don't dim disabled items
+        # much. The tree is read-only in M1 anyway, so losing
+        # selectability costs nothing yet - revisit if M2 needs to select
+        # a suppressed row (e.g. to unsuppress it).
+        item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEnabled)
+        disabled_text = QtWidgets.QApplication.palette().color(
+            QtGui.QPalette.ColorGroup.Disabled, QtGui.QPalette.ColorRole.Text
+        )
+        for column in (0, 1):
+            font = item.font(column)
+            font.setItalic(True)
+            item.setFont(column, font)
+            item.setForeground(column, disabled_text)
+    elif row.state == ERROR:
+        icon = QtWidgets.QApplication.style().standardIcon(
+            QtWidgets.QStyle.StandardPixmap.SP_MessageBoxWarning
+        )
+        item.setIcon(0, icon)
+
     for child in row.children:
         item.addChild(_make_item(child))
     return item
