@@ -25,12 +25,14 @@ from .model import (
     dissolve_group,
     find_dependencies,
     find_dependents,
+    is_hover_highlight_enabled,
     isolate_object,
     load_groups,
     move_to_group,
     rename_group,
     rename_label,
     restore_visibilities,
+    set_hover_highlight_enabled,
     toggle_suppressed,
 )
 
@@ -181,7 +183,30 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
         super().__init__("ATPD - Feature Tree", parent)
         self.setObjectName("ATPD_FeatureTreePanel")
 
-        self._tree = QtWidgets.QTreeWidget(self)
+        container = QtWidgets.QWidget(self)
+        layout = QtWidgets.QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        header = QtWidgets.QToolBar(container)
+        header.setObjectName("ATPD_FeatureTreeHeaderToolbar")
+        header.setIconSize(QtCore.QSize(16, 16))
+        header.setMovable(False)
+        header.setFloatable(False)
+        layout.addWidget(header)
+
+        self._hover_highlight_action = self._add_persisted_toggle(
+            header,
+            QtWidgets.QApplication.style().standardIcon(
+                QtWidgets.QStyle.StandardPixmap.SP_FileDialogInfoView
+            ),
+            "Highlight dependencies on hover/selection",
+            is_hover_highlight_enabled,
+            set_hover_highlight_enabled,
+            on_toggled=self._on_hover_highlight_toggled,
+        )
+
+        self._tree = QtWidgets.QTreeWidget(container)
         self._tree.setColumnCount(2)
         self._tree.setHeaderLabels(["Feature", "Type"])
         # Explicit, not relying on Qt's default: Ctrl/Shift-click multi-select
@@ -211,7 +236,8 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
         # entirely (as opposed to moving to a different item, which just
         # fires itemEntered again) via an event filter instead.
         self._tree.viewport().installEventFilter(self)
-        self.setWidget(self._tree)
+        layout.addWidget(self._tree)
+        self.setWidget(container)
 
         self._observer = _TreeDocumentObserver(self.refresh)
         Gui.addDocumentObserver(self._observer)
@@ -271,6 +297,45 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
         Gui.removeDocumentObserver(self._observer)
         super().closeEvent(event)
 
+    def _add_persisted_toggle(
+        self,
+        toolbar: QtWidgets.QToolBar,
+        icon: QtGui.QIcon,
+        tooltip: str,
+        get_value,
+        set_value,
+        on_toggled=None,
+    ) -> QtGui.QAction:
+        """Add a checkable header-toolbar action backed by a persisted
+        (non-document) FreeCAD user preference.
+
+        This is the pattern to follow for any future header button that
+        needs a remembered on/off state: write get/set functions in
+        model.py (see is_hover_highlight_enabled/set_hover_highlight_enabled)
+        and call this once with them - loading the saved state, wiring
+        persistence, and optionally reacting to the change are all
+        handled here instead of being copy-pasted per button.
+        """
+        action = toolbar.addAction(icon, tooltip)
+        action.setCheckable(True)
+        action.setChecked(get_value())
+
+        def handle_toggled(checked: bool) -> None:
+            set_value(checked)
+            if on_toggled is not None:
+                on_toggled(checked)
+
+        action.toggled.connect(handle_toggled)
+        return action
+
+    def _on_hover_highlight_toggled(self, checked: bool) -> None:
+        App.Console.PrintMessage(f"ATPD tree DEBUG: hover highlight enabled -> {checked}\n")
+        # _apply_highlight() itself gates on the action's checked state
+        # and always clears first, so this one call correctly handles
+        # both directions: turning it off wipes any current highlight,
+        # turning it back on immediately re-shows the selection's.
+        self._apply_highlight(self._selected_highlight_name if checked else None)
+
     def eventFilter(self, watched, event: QtCore.QEvent) -> bool:
         if watched is self._tree.viewport() and event.type() == QtCore.QEvent.Type.Leave:
             # Mouse left the tree entirely - revert to the selection's
@@ -306,9 +371,15 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
         (InList), on top of whatever suppressed/error foreground styling
         is already on those rows - setBackground()/setForeground() are
         independent, so neither overwrites the other.
+
+        Single gate point for the header toolbar's on/off toggle: every
+        caller (hover, selection change, hover-leave reverting to the
+        selection) goes through here, so checking
+        self._hover_highlight_action once is enough - no need to guard
+        each call site separately.
         """
         self._clear_highlight()
-        if not name:
+        if not name or not self._hover_highlight_action.isChecked():
             return
         doc = App.ActiveDocument
         if doc is None:
