@@ -5,11 +5,15 @@ Deliberately has no Qt/Gui dependency, so it can be exercised headlessly
 panel (panel.py) is a thin consumer of collect_body_features().
 """
 
+import json
 from dataclasses import dataclass, field
 
 ACTIVE = "active"
 SUPPRESSED = "suppressed"
 ERROR = "error"
+
+GROUP_TYPE_ID = "Group"
+_GROUPS_PROPERTY = "ATPD_Groups"
 
 _LINK_PROPERTY_TYPES = frozenset(
     {
@@ -38,13 +42,20 @@ _NON_CONSUMER_LINK_PROPERTIES = frozenset(
 
 @dataclass(frozen=True)
 class FeatureRow:
-    """One row of the read-only feature tree, with its nested children."""
+    """One row of the read-only feature tree, with its nested children.
+
+    A row with is_group=True is a purely visual folder (see the group_*
+    functions below): name holds the group id, label its display name,
+    type_id is GROUP_TYPE_ID, and state is always ACTIVE (folders have no
+    Suppressed/error concept of their own).
+    """
 
     name: str
     label: str
     type_id: str
     state: str
     children: list["FeatureRow"] = field(default_factory=list)
+    is_group: bool = False
 
 
 def simplify_type_id(type_id: str) -> str:
@@ -177,7 +188,41 @@ def collect_body_features(body) -> list[FeatureRow]:
         else:
             top_level.append(row)
 
-    return top_level
+    return _apply_groups(body, top_level)
+
+
+def _apply_groups(body, top_level: list[FeatureRow]) -> list[FeatureRow]:
+    """Nest top-level rows under their ATPD group folder, if any.
+
+    A group folder appears at the position of its earliest member (the
+    first one encountered while walking top_level, which is already in
+    Tip order) - no separate ordering field needed. Rows for objects
+    with no recorded group, or whose recorded group id no longer exists,
+    are left untouched at the top level.
+    """
+    groups, membership = load_groups(body)
+    if not groups:
+        return top_level
+
+    group_rows: dict[str, FeatureRow] = {}
+    result: list[FeatureRow] = []
+    for row in top_level:
+        group_id = membership.get(row.name)
+        if group_id is None or group_id not in groups:
+            result.append(row)
+            continue
+        if group_id not in group_rows:
+            group_row = FeatureRow(
+                name=group_id,
+                label=groups[group_id],
+                type_id=GROUP_TYPE_ID,
+                state=ACTIVE,
+                is_group=True,
+            )
+            group_rows[group_id] = group_row
+            result.append(group_row)
+        group_rows[group_id].children.append(row)
+    return result
 
 
 def find_dependents(obj) -> list:
@@ -289,3 +334,116 @@ def restore_visibilities(doc, previous: dict[str, bool]) -> None:
         view_object = getattr(obj, "ViewObject", None) if obj is not None else None
         if view_object is not None:
             view_object.Visibility = visible
+
+
+def _ensure_groups_property(obj) -> None:
+    """Add the ATPD_Groups custom property to obj (the Body) if missing.
+
+    A plain App::PropertyString holding JSON - a real, ordinary FreeCAD
+    property, so the file stays ENF3-compatible: vanilla FreeCAD just
+    shows it as an extra Data-tab property it doesn't understand, and
+    nothing about the document's actual geometry/features changes.
+    Hidden from the property editor since it's an ATPD implementation
+    detail, not something a user should hand-edit.
+    """
+    if _GROUPS_PROPERTY not in obj.PropertiesList:
+        obj.addProperty(
+            "App::PropertyString",
+            _GROUPS_PROPERTY,
+            "ATPD",
+            "ATPD feature groups (JSON) - organizational only, not a real FreeCAD structure",
+        )
+        obj.setPropertyStatus(_GROUPS_PROPERTY, "Hidden")
+
+
+def load_groups(obj) -> tuple[dict[str, str], dict[str, str]]:
+    """Read (group_id -> group_name, feature_name -> group_id) from obj.
+
+    obj is normally the Body. Missing property, blank value, or corrupt
+    JSON all return two empty dicts rather than raising - groups are a
+    pure UI convenience layered on top of the real document, never
+    something that should stop the tree from displaying.
+    """
+    if _GROUPS_PROPERTY not in obj.PropertiesList:
+        return {}, {}
+    raw = getattr(obj, _GROUPS_PROPERTY, "")
+    if not raw:
+        return {}, {}
+    try:
+        data = json.loads(raw)
+        return dict(data.get("groups", {})), dict(data.get("membership", {}))
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return {}, {}
+
+
+def save_groups(
+    doc, obj, groups: dict[str, str], membership: dict[str, str]
+) -> None:
+    """Persist (groups, membership) to obj's custom property, in a transaction."""
+    _ensure_groups_property(obj)
+    payload = json.dumps({"groups": groups, "membership": membership})
+    doc.openTransaction("Update ATPD groups")
+    try:
+        setattr(obj, _GROUPS_PROPERTY, payload)
+    except Exception:
+        doc.abortTransaction()
+        raise
+    doc.commitTransaction()
+
+
+def _new_group_id(existing: dict[str, str]) -> str:
+    i = 1
+    while f"group_{i}" in existing:
+        i += 1
+    return f"group_{i}"
+
+
+def create_group(doc, obj, name: str, member_names: list[str]) -> str:
+    """Create a new group named `name` containing member_names.
+
+    Any member already in another group is moved (a name can only ever
+    belong to one group at a time). Returns the new group's id.
+    """
+    groups, membership = load_groups(obj)
+    group_id = _new_group_id(groups)
+    groups[group_id] = name
+    for member in member_names:
+        membership[member] = group_id
+    save_groups(doc, obj, groups, membership)
+    return group_id
+
+
+def rename_group(doc, obj, group_id: str, new_name: str) -> bool:
+    """Rename a group. Returns whether it was actually applied.
+
+    Blank/whitespace-only input and an unknown group_id are both
+    rejected (no-op), same rejection shape as rename_label().
+    """
+    new_name = new_name.strip()
+    groups, membership = load_groups(obj)
+    if group_id not in groups or not new_name or groups[group_id] == new_name:
+        return False
+    groups[group_id] = new_name
+    save_groups(doc, obj, groups, membership)
+    return True
+
+
+def dissolve_group(doc, obj, group_id: str) -> None:
+    """Remove a group, promoting its members back to the top level."""
+    groups, membership = load_groups(obj)
+    if group_id not in groups:
+        return
+    del groups[group_id]
+    membership = {name: gid for name, gid in membership.items() if gid != group_id}
+    save_groups(doc, obj, groups, membership)
+
+
+def move_to_group(doc, obj, member_names: list[str], group_id: str | None) -> None:
+    """Move features into a group, or to the top level if group_id is None."""
+    groups, membership = load_groups(obj)
+    for member in member_names:
+        if group_id is None:
+            membership.pop(member, None)
+        else:
+            membership[member] = group_id
+    save_groups(doc, obj, groups, membership)

@@ -337,6 +337,64 @@ def test_isolate_object_degrades_gracefully_headlessly():
         App.closeDocument(doc.Name)
 
 
+def test_group_persistence_across_real_reopen():
+    """Groups must survive an actual save-to-disk + close + reopen cycle,
+    not just staying correct in memory.
+
+    Uses 02_complex.FCStd (30+ features, the intended real-world case for
+    grouping) via a temp-directory copy - the reference file itself is
+    only ever read, never opened as the mutation target, and its mtime
+    is asserted unchanged at the end.
+    """
+    from atpd.tree.model import collect_body_features, create_group, load_groups
+
+    src = os.path.join(_REFERENCE_FILES_DIR, "02_complex.FCStd")
+    mtime_before = os.path.getmtime(src)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        copy_path = os.path.join(tmp_dir, "02_complex_copy.FCStd")
+        shutil.copyfile(src, copy_path)
+
+        doc = App.openDocument(copy_path)
+        body = next(obj for obj in doc.Objects if obj.TypeId == "PartDesign::Body")
+
+        group_ids = {
+            create_group(doc, body, "Base Pads", ["Pad", "Pad001", "Pad002"]),
+            create_group(doc, body, "Dress-up", ["Chamfer", "Chamfer001", "Fillet"]),
+            create_group(doc, body, "Datums", ["DatumPlane", "DatumPlane001", "DatumLine"]),
+        }
+        assert len(group_ids) == 3, "expected 3 distinct group ids"
+
+        doc.save()
+        App.closeDocument(doc.Name)
+
+        # Real reopen from disk - a fresh Python object, not the same one
+        # we just wrote to, so there's no way stale in-memory state could
+        # paper over a persistence bug.
+        doc2 = App.openDocument(copy_path)
+        try:
+            body2 = next(obj for obj in doc2.Objects if obj.TypeId == "PartDesign::Body")
+
+            groups, membership = load_groups(body2)
+            assert len(groups) == 3, f"expected 3 groups after reopen, got {groups}"
+            assert set(groups.values()) == {"Base Pads", "Dress-up", "Datums"}
+            assert membership["Pad"] == membership["Pad001"] == membership["Pad002"]
+            assert membership["Chamfer"] == membership["Fillet"]
+
+            rows = collect_body_features(body2)
+            group_rows = {row.label: row for row in rows if row.is_group}
+            assert set(group_rows) == {"Base Pads", "Dress-up", "Datums"}
+            assert {child.name for child in group_rows["Base Pads"].children} == {
+                "Pad",
+                "Pad001",
+                "Pad002",
+            }
+        finally:
+            App.closeDocument(doc2.Name)
+
+    assert os.path.getmtime(src) == mtime_before, "reference file must never be modified"
+
+
 def _collect_tests():
     module = sys.modules[__name__]
     return [
