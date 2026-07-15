@@ -20,15 +20,21 @@ from .model import (
     FeatureRow,
     collect_body_features,
     count_rows,
+    create_group,
     delete_objects,
+    dissolve_group,
     find_dependents,
     isolate_object,
+    load_groups,
+    move_to_group,
+    rename_group,
     rename_label,
     restore_visibilities,
     toggle_suppressed,
 )
 
 _NAME_ROLE = QtCore.Qt.ItemDataRole.UserRole
+_IS_GROUP_ROLE = QtCore.Qt.ItemDataRole.UserRole + 1
 
 
 def _active_body():
@@ -85,6 +91,21 @@ class _TreeDocumentObserver:
 
 def _make_item(row: FeatureRow) -> QtWidgets.QTreeWidgetItem:
     """Build a QTreeWidgetItem for a row, recursively nesting its children."""
+    if row.is_group:
+        item = QtWidgets.QTreeWidgetItem([row.label, row.type_id])
+        item.setToolTip(0, row.label)
+        item.setData(0, _NAME_ROLE, row.name)
+        item.setData(0, _IS_GROUP_ROLE, True)
+        item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsEditable)
+        item.setIcon(
+            0, QtWidgets.QApplication.style().standardIcon(
+                QtWidgets.QStyle.StandardPixmap.SP_DirIcon
+            ),
+        )
+        for child in row.children:
+            item.addChild(_make_item(child))
+        return item
+
     item = QtWidgets.QTreeWidgetItem([row.label, row.type_id])
     item.setToolTip(0, row.label)
     item.setToolTip(1, row.type_id)
@@ -140,6 +161,9 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
         self._tree = QtWidgets.QTreeWidget(self)
         self._tree.setColumnCount(2)
         self._tree.setHeaderLabels(["Feature", "Type"])
+        # Explicit, not relying on Qt's default: Ctrl/Shift-click multi-select
+        # is required for "Group into Folder".
+        self._tree.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         self._tree.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self._tree.customContextMenuRequested.connect(self._on_context_menu)
         self._tree.itemDoubleClicked.connect(self._on_item_double_clicked)
@@ -210,7 +234,14 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
         return doc.getObject(name)
 
     def _on_item_double_clicked(self, item: QtWidgets.QTreeWidgetItem, column: int) -> None:
-        """Fast double-click means Edit - Suppress/Unsuppress is context-menu only."""
+        """Fast double-click means Edit - Suppress/Unsuppress is context-menu only.
+
+        A group folder has no native "edit" concept and no real object to
+        resolve; Qt's own default expand/collapse-on-double-click already
+        applies to it, so there's nothing extra to do here.
+        """
+        if item.data(0, _IS_GROUP_ROLE):
+            return
         obj = self._resolve_object(item)
         if obj is None:
             App.Console.PrintMessage("ATPD tree DEBUG: double-click on an unresolved item\n")
@@ -230,7 +261,54 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
 
     def _on_context_menu(self, pos: QtCore.QPoint) -> None:
         item = self._tree.itemAt(pos)
-        obj = self._resolve_object(item) if item is not None else None
+        if item is None:
+            return
+
+        selected = self._tree.selectedItems()
+        if len(selected) > 1:
+            self._show_multi_select_menu(pos, selected)
+            return
+
+        if item.data(0, _IS_GROUP_ROLE):
+            self._show_group_menu(pos, item)
+            return
+
+        self._show_feature_menu(pos, item)
+
+    def _show_multi_select_menu(
+        self, pos: QtCore.QPoint, selected_items: list[QtWidgets.QTreeWidgetItem]
+    ) -> None:
+        """Menu for a multi-selection: only "Group into Folder" for now.
+
+        Group folders can't themselves be grouped (no nested folders in
+        this version) - any selected folder is silently skipped.
+        """
+        member_names = [
+            obj.Name
+            for it in selected_items
+            if not it.data(0, _IS_GROUP_ROLE) and (obj := self._resolve_object(it)) is not None
+        ]
+        if not member_names:
+            return
+
+        menu = QtWidgets.QMenu(self._tree)
+        group_action = menu.addAction("Group into Folder…")
+        chosen = menu.exec(self._tree.viewport().mapToGlobal(pos))
+        if chosen is group_action:
+            self._group_into_folder(member_names)
+
+    def _show_group_menu(self, pos: QtCore.QPoint, item: QtWidgets.QTreeWidgetItem) -> None:
+        """Menu for a group folder. Renaming reuses F2/click-to-edit, same
+        as features - no separate "Rename" entry needed here."""
+        group_id = item.data(0, _NAME_ROLE)
+        menu = QtWidgets.QMenu(self._tree)
+        dissolve_action = menu.addAction("Dissolve Folder")
+        chosen = menu.exec(self._tree.viewport().mapToGlobal(pos))
+        if chosen is dissolve_action:
+            self._dissolve_group(group_id)
+
+    def _show_feature_menu(self, pos: QtCore.QPoint, item: QtWidgets.QTreeWidgetItem) -> None:
+        obj = self._resolve_object(item)
         if obj is None:
             return
 
@@ -259,6 +337,20 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
             "Restore Visibility" if self._isolated_name == obj.Name else "Isolate"
         )
 
+        body = _active_body()
+        groups, membership = load_groups(body) if body is not None else ({}, {})
+        move_actions: dict[QtGui.QAction, str | None] = {}
+        if groups:
+            menu.addSeparator()
+            move_menu = menu.addMenu("Move to")
+            current_group = membership.get(obj.Name)
+            for group_id, group_name in groups.items():
+                if group_id == current_group:
+                    continue
+                move_actions[move_menu.addAction(group_name)] = group_id
+            if current_group is not None:
+                move_actions[move_menu.addAction("Top Level")] = None
+
         chosen = menu.exec(self._tree.viewport().mapToGlobal(pos))
         if chosen is None:
             return
@@ -274,6 +366,8 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
             self._goto_sketch(sketch_child)
         elif chosen is isolate_action:
             self._toggle_isolate(obj)
+        elif chosen in move_actions:
+            self._move_feature(obj, move_actions[chosen])
 
     def _toggle_suppress(self, obj) -> None:
         """Suppress/unsuppress obj, warning about dependents first if any."""
@@ -318,6 +412,9 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
         custom keyPressEvent needed here.
         """
         if column != 0:
+            return
+        if item.data(0, _IS_GROUP_ROLE):
+            self._on_group_renamed(item)
             return
         obj = self._resolve_object(item)
         if obj is None:
@@ -468,3 +565,77 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
         App.Console.PrintMessage(f"ATPD tree DEBUG: isolating {obj.Name}\n")
         self._isolated_saved_visibility = isolate_object(body.Group, obj)
         self._isolated_name = obj.Name
+
+    def _group_into_folder(self, member_names: list[str]) -> None:
+        body = _active_body()
+        if body is None:
+            return
+        name, ok = QtWidgets.QInputDialog.getText(self, "Group into Folder", "Folder name:")
+        if not ok or not name.strip():
+            App.Console.PrintMessage("ATPD tree DEBUG: group-into-folder cancelled or blank\n")
+            return
+        try:
+            group_id = create_group(body.Document, body, name.strip(), member_names)
+        except Exception as exc:
+            App.Console.PrintError(f"ATPD tree: failed to create group: {exc}\n")
+            QtWidgets.QMessageBox.critical(self, "Error", f"Failed to create folder:\n{exc}")
+            return
+        App.Console.PrintMessage(
+            f"ATPD tree DEBUG: created group {group_id!r} with members {member_names}\n"
+        )
+        self.refresh()
+
+    def _dissolve_group(self, group_id: str) -> None:
+        body = _active_body()
+        if body is None:
+            return
+        try:
+            dissolve_group(body.Document, body, group_id)
+        except Exception as exc:
+            App.Console.PrintError(f"ATPD tree: failed to dissolve group {group_id}: {exc}\n")
+            QtWidgets.QMessageBox.critical(self, "Error", f"Failed to dissolve folder:\n{exc}")
+            return
+        App.Console.PrintMessage(f"ATPD tree DEBUG: dissolved group {group_id}\n")
+        self.refresh()
+
+    def _move_feature(self, obj, group_id: str | None) -> None:
+        body = _active_body()
+        if body is None:
+            return
+        try:
+            move_to_group(body.Document, body, [obj.Name], group_id)
+        except Exception as exc:
+            App.Console.PrintError(f"ATPD tree: failed to move {obj.Name}: {exc}\n")
+            QtWidgets.QMessageBox.critical(self, "Error", f'Failed to move "{obj.Label}":\n{exc}')
+            return
+        App.Console.PrintMessage(f"ATPD tree DEBUG: moved {obj.Name} to group {group_id!r}\n")
+        self.refresh()
+
+    def _on_group_renamed(self, item: QtWidgets.QTreeWidgetItem) -> None:
+        """Apply an inline-edited folder name, or restore it if rejected."""
+        group_id = item.data(0, _NAME_ROLE)
+        body = _active_body()
+        if body is None:
+            return
+
+        new_text = item.text(0)
+        try:
+            applied = rename_group(body.Document, body, group_id, new_text)
+        except Exception as exc:
+            App.Console.PrintError(f"ATPD tree: failed to rename group {group_id}: {exc}\n")
+            QtWidgets.QMessageBox.critical(self, "Error", f"Failed to rename folder:\n{exc}")
+            applied = False
+
+        groups, _ = load_groups(body)
+        current_name = groups.get(group_id, item.text(0))
+        if applied:
+            App.Console.PrintMessage(
+                f"ATPD tree DEBUG: group {group_id}.name -> {current_name!r}\n"
+            )
+            self.refresh()
+        else:
+            App.Console.PrintMessage(
+                f"ATPD tree DEBUG: rename of group {group_id} rejected, "
+                f"restoring {current_name!r}\n"
+            )
+            item.setText(0, current_name)
