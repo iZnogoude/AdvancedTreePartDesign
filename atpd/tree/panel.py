@@ -831,6 +831,31 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
         self._isolated_saved_visibility = isolate_object(body.Group, obj)
         self._isolated_name = obj.Name
 
+    def _show_only_tip_feature(self, feature) -> None:
+        """Make feature the only visible one in its Body - the missing
+        piece that makes the *native* Model tree redraw its own
+        rollback-bar/grayed-beyond-tip styling after we move Tip.
+
+        Setting Body.Tip and recomputing (what move_rollback_bar() and
+        insert_feature_at_rollback_bar() do) changes the data - correctly,
+        confirmed by inspecting the object in the Python console - but
+        FreeCAD's native tree doesn't key its "beyond tip" graying off
+        Tip directly. It's the generic tree widget's ordinary rendering
+        of hidden objects: PartDesignGui::ViewProvider::onChanged()
+        (src/Mod/PartDesign/Gui/ViewProvider.cpp) hides every *other*
+        feature in the body as soon as one feature's own Visibility
+        becomes True. FreeCAD's native "Move tip to here" command
+        (CmdPartDesignMoveTip::activated(), CommandBody.cpp) does exactly
+        this via FCMD_OBJ_SHOW(selFeature) right after setting Tip - this
+        reproduces that, not something Tip/recompute alone trigger.
+
+        No-op headlessly (ViewObject is None without a Gui session, e.g.
+        FreeCADCmd) - there's nothing to show/hide without a 3D view.
+        """
+        view_object = getattr(feature, "ViewObject", None)
+        if view_object is not None:
+            view_object.Visibility = True
+
     def _move_rollback_bar(self, obj) -> None:
         """Move the Body's Tip - the rollback bar's position - to obj.
 
@@ -851,6 +876,7 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
                 self, "Error", f'Failed to move rollback bar to "{obj.Label}":\n{exc}'
             )
             return
+        self._show_only_tip_feature(obj)
         App.Console.PrintMessage(f"ATPD tree DEBUG: rollback bar moved to {obj.Name}\n")
         self.refresh()
 
@@ -902,6 +928,7 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
             )
             return False
 
+        self._show_only_tip_feature(new_feature)
         App.Console.PrintMessage(f"ATPD tree DEBUG: inserted {new_feature.Name} at rollback bar\n")
         self.refresh()
         return True
