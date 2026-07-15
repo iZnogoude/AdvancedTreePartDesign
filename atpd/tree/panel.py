@@ -55,6 +55,72 @@ _HIGHLIGHT_PARENT_ALPHA = 55
 _HIGHLIGHT_CHILD_ALPHA = 110
 
 
+_panel = None
+
+
+def get_panel():
+    """Return the singleton FeatureTreePanel if it has been created (the
+    dock widget is created lazily on first "Feature Tree" activation), or
+    None otherwise. Lets other commands (e.g. M4 feature-creation ones)
+    refresh the panel after mutating the document without forcing it open.
+    """
+    return _panel
+
+
+def get_or_create_panel(main_window):
+    """Return the singleton FeatureTreePanel, creating and docking it on
+    first use. Kept here (not in command.py) so anything needing the
+    panel - including modules that must stay importable under FreeCADCmd,
+    where Gui.addCommand() doesn't exist - can get it without pulling in
+    command.py's module-level addCommand() call.
+    """
+    global _panel
+    if _panel is None:
+        _panel = FeatureTreePanel(main_window)
+        main_window.addDockWidget(QtCore.Qt.RightDockWidgetArea, _panel)
+    return _panel
+
+
+def warn_downstream_dressup_risk(parent_widget, body) -> bool:
+    """Warn if inserting a feature at the Body's current Tip risks the
+    Topological Naming Problem (docs/spike_rollback_findings.md), via
+    find_downstream_dressup_risk(). Returns whether to proceed (True if
+    there was nothing at risk, or the user chose to continue anyway).
+
+    Factored out of _insert_feature_with_rollback_warning() so any M4
+    feature-creation command (not just this panel's own context-menu
+    actions) can reuse the exact same check and wording.
+    """
+    at_risk = find_downstream_dressup_risk(body)
+    if not at_risk:
+        return True
+    names = ", ".join(feature.Label for feature in at_risk)
+    reply = QtWidgets.QMessageBox.warning(
+        parent_widget,
+        "Topological naming risk",
+        f"Inserting a feature here may invalidate the following "
+        f"Dress-Up feature(s), which reference specific edges/faces "
+        f"of the shape at this point: {names}.\n\n"
+        f"This is a known FreeCAD kernel limitation (the "
+        f"Topological Naming Problem), not something ATPD can "
+        f"prevent - see docs/spike_rollback_findings.md.\n\nContinue?",
+        QtWidgets.QMessageBox.StandardButton.Ok
+        | QtWidgets.QMessageBox.StandardButton.Cancel,
+    )
+    return reply == QtWidgets.QMessageBox.StandardButton.Ok
+
+
+def show_only_tip_feature(feature) -> None:
+    """Make feature the only visible one in its Body - see
+    FeatureTreePanel._show_only_tip_feature() for the full rationale.
+    Module-level so non-panel callers (M4 feature-creation commands) can
+    reuse it too, without needing a live FeatureTreePanel instance.
+    """
+    view_object = getattr(feature, "ViewObject", None)
+    if view_object is not None:
+        view_object.Visibility = True
+
+
 def _active_body():
     """Return the active PartDesign Body of the active document, or None.
 
@@ -852,9 +918,7 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
         No-op headlessly (ViewObject is None without a Gui session, e.g.
         FreeCADCmd) - there's nothing to show/hide without a 3D view.
         """
-        view_object = getattr(feature, "ViewObject", None)
-        if view_object is not None:
-            view_object.Visibility = True
+        show_only_tip_feature(feature)
 
     def _move_rollback_bar(self, obj) -> None:
         """Move the Body's Tip - the rollback bar's position - to obj.
@@ -898,24 +962,9 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
         if body is None:
             return False
 
-        at_risk = find_downstream_dressup_risk(body)
-        if at_risk:
-            names = ", ".join(feature.Label for feature in at_risk)
-            reply = QtWidgets.QMessageBox.warning(
-                self,
-                "Topological naming risk",
-                f"Inserting a feature here may invalidate the following "
-                f"Dress-Up feature(s), which reference specific edges/faces "
-                f"of the shape at this point: {names}.\n\n"
-                f"This is a known FreeCAD kernel limitation (the "
-                f"Topological Naming Problem), not something ATPD can "
-                f"prevent - see docs/spike_rollback_findings.md.\n\nContinue?",
-                QtWidgets.QMessageBox.StandardButton.Ok
-                | QtWidgets.QMessageBox.StandardButton.Cancel,
-            )
-            if reply != QtWidgets.QMessageBox.StandardButton.Ok:
-                App.Console.PrintMessage("ATPD tree DEBUG: insert at rollback bar cancelled\n")
-                return False
+        if not warn_downstream_dressup_risk(self, body):
+            App.Console.PrintMessage("ATPD tree DEBUG: insert at rollback bar cancelled\n")
+            return False
 
         try:
             insert_feature_at_rollback_bar(body.Document, body, new_feature, sketch)
