@@ -225,24 +225,44 @@ def _apply_groups(body, top_level: list[FeatureRow]) -> list[FeatureRow]:
     return result
 
 
-def find_dependents(obj) -> list:
-    """Other document objects that reference obj, excluding its own Body.
+def _related_objects(obj, list_attr: str) -> list:
+    """Shared dedup + own-Body exclusion for the InList/OutList lookups below.
 
-    obj.InList always includes the Body (via its Group property), which
-    isn't a meaningful "this depends on obj" relationship for a suppress
-    warning, so it's filtered out. InList can also list the same object
-    more than once when it references obj through several properties
-    (e.g. both AttachmentSupport and ExternalGeometry), so results are
-    deduped, preserving order.
+    obj.InList/OutList always include the Body (via its Group property),
+    which isn't a meaningful dependency relationship for either warning
+    or highlighting purposes, so it's filtered out. Both lists can also
+    list the same object more than once when it's linked through several
+    properties (e.g. both AttachmentSupport and ExternalGeometry), so
+    results are deduped, preserving order.
     """
     seen = set()
-    dependents = []
-    for other in obj.InList:
+    related = []
+    for other in getattr(obj, list_attr):
         if other.TypeId == "PartDesign::Body" or other.Name in seen:
             continue
         seen.add(other.Name)
-        dependents.append(other)
-    return dependents
+        related.append(other)
+    return related
+
+
+def find_dependents(obj) -> list:
+    """Other document objects that reference obj (consume/depend on it).
+
+    This is obj.InList: objects pointing *to* obj. Used for the
+    suppress/delete impact warning and, as "children", for the
+    dependency-highlight feature.
+    """
+    return _related_objects(obj, "InList")
+
+
+def find_dependencies(obj) -> list:
+    """Other document objects that obj itself references (its prerequisites).
+
+    This is obj.OutList: objects obj points *to* - e.g. a Pad's Profile
+    sketch or its BaseFeature. Used as "parents" for the
+    dependency-highlight feature.
+    """
+    return _related_objects(obj, "OutList")
 
 
 def toggle_suppressed(doc, obj) -> bool:

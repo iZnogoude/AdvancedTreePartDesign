@@ -20,6 +20,12 @@ if _REPO_ROOT not in sys.path:
 
 _REFERENCE_FILES_DIR = os.path.join(_REPO_ROOT, "tests", "files")
 
+# Only matters for the one test that builds real Qt widgets
+# (test_dependency_highlight) - setting this here, before any
+# QApplication is constructed, lets it run without a display server
+# regardless of how this file itself gets invoked.
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 import FreeCAD as App  # noqa: E402
 
 
@@ -393,6 +399,75 @@ def test_group_persistence_across_real_reopen():
             App.closeDocument(doc2.Name)
 
     assert os.path.getmtime(src) == mtime_before, "reference file must never be modified"
+
+
+def test_dependency_highlight():
+    """Hovering/selecting a feature must highlight its parents (OutList)
+    and children (InList) - and only those - via background color.
+
+    Uses 03_cross_deps.FCStd, the file built for this exact
+    cross-dependency scenario, and exercises the real
+    _apply_highlight()/_make_item() logic under a genuine (offscreen)
+    QApplication - a FeatureTreePanel is built via __new__() rather than
+    the normal constructor, since __init__ calls
+    Gui.addDocumentObserver(), unavailable under FreeCADCmd; only the
+    Qt-item/highlighting behavior is under test here, not the observer
+    wiring (already covered structurally by every other panel-touching
+    test in this file relying on __init__ never being reachable
+    headlessly at all).
+    """
+    from PySide6 import QtCore, QtWidgets
+
+    from atpd.tree.model import collect_body_features
+    from atpd.tree.panel import (
+        _HIGHLIGHT_CHILD_ALPHA,
+        _HIGHLIGHT_PARENT_ALPHA,
+        FeatureTreePanel,
+        _make_item,
+    )
+
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    doc = App.openDocument(os.path.join(_REFERENCE_FILES_DIR, "03_cross_deps.FCStd"))
+    try:
+        body = next(obj for obj in doc.Objects if obj.TypeId == "PartDesign::Body")
+        rows = collect_body_features(body)
+
+        panel = FeatureTreePanel.__new__(FeatureTreePanel)
+        panel._items_by_name = {}
+        panel._highlighted_items = []
+        panel._selected_highlight_name = None
+        for row in rows:
+            _make_item(row, panel._items_by_name)
+
+        # Pad001: consumed by Pad002 (child, via InList) via its edges;
+        # itself consumes Sketch001 (Profile) and Pad (BaseFeature) as
+        # parents, via OutList.
+        panel._apply_highlight("Pad001")
+
+        name_role = QtCore.Qt.ItemDataRole.UserRole
+        highlighted = {
+            item.data(0, name_role): item.background(0).color().alpha()
+            for item in panel._highlighted_items
+        }
+        assert highlighted == {
+            "Sketch001": _HIGHLIGHT_PARENT_ALPHA,
+            "Pad": _HIGHLIGHT_PARENT_ALPHA,
+            "Pad002": _HIGHLIGHT_CHILD_ALPHA,
+        }, highlighted
+
+        untouched_names = set(panel._items_by_name) - set(highlighted) - {"Pad001"}
+        for name in untouched_names:
+            style = panel._items_by_name[name].background(0).style()
+            assert style == QtCore.Qt.BrushStyle.NoBrush, f"{name} unexpectedly highlighted"
+
+        panel._clear_highlight()
+        assert panel._highlighted_items == []
+        for name in highlighted:
+            style = panel._items_by_name[name].background(0).style()
+            assert style == QtCore.Qt.BrushStyle.NoBrush, f"{name} still highlighted after clear"
+    finally:
+        App.closeDocument(doc.Name)
 
 
 def _collect_tests():
