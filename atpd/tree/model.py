@@ -64,6 +64,7 @@ class FeatureRow:
     state: str
     children: list["FeatureRow"] = field(default_factory=list)
     is_group: bool = False
+    beyond_tip: bool = False
 
 
 def simplify_type_id(type_id: str) -> str:
@@ -177,14 +178,22 @@ def collect_body_features(body) -> list[FeatureRow]:
     objects = list(body.Group)
     parent_of = _resolve_parents(objects)
 
+    # Body.Group is already in Tip order (established since M1), so
+    # "beyond the rollback bar" is simply "comes after Tip's own index".
+    # Falls back to "nothing is beyond" if Tip is somehow unset, rather
+    # than guessing.
+    tip = body.Tip
+    tip_index = objects.index(tip) if tip in objects else len(objects) - 1
+
     rows_by_name = {
         obj.Name: FeatureRow(
             name=obj.Name,
             label=obj.Label,
             type_id=simplify_type_id(obj.TypeId),
             state=feature_state(obj),
+            beyond_tip=index > tip_index,
         )
-        for obj in objects
+        for index, obj in enumerate(objects)
     }
 
     top_level: list[FeatureRow] = []
@@ -495,3 +504,119 @@ def is_hover_highlight_enabled() -> bool:
 
 def set_hover_highlight_enabled(value: bool) -> None:
     App.ParamGet(_PREFERENCES_GROUP).SetBool(_HOVER_HIGHLIGHT_PARAM, bool(value))
+
+
+# --- Rollback bar (M3) -----------------------------------------------
+#
+# Design backed by the M3 spike (docs/spike_rollback_findings.md):
+# Body.insertObject() + Body.Tip already handle the hard part (ordering,
+# BaseFeature relinking) robustly - verified for real, not assumed. The
+# real risk is FreeCAD's Topological Naming Problem breaking a Dressup
+# feature immediately downstream of an insertion point; that's a known
+# kernel limitation we surface as a warning, not something to solve
+# here.
+
+_DRESSUP_TYPE_IDS = frozenset({"PartDesign::Chamfer", "PartDesign::Fillet", "PartDesign::Draft"})
+
+
+def is_solid_feature(obj) -> bool:
+    """Whether obj is a real, shape-producing feature that can be a Tip.
+
+    Sketches and datums never produce a body shape on their own and can
+    never be a Body's Tip. Everything else in a Body.Group (Pad, Pocket,
+    Fillet, AdditivePipe, PartDesign::FeatureBase, ...) can.
+    """
+    return not is_nestable(obj) and not obj.TypeId.startswith("Part::Datum")
+
+
+def get_next_solid_feature(body, feature):
+    """Python reimplementation of PartDesign::Body::getNextSolidFeature().
+
+    That C++ method (like getPrevSolidFeature/isAfterInsertPoint) is not
+    exposed to Python (confirmed in the M3 spike), so this walks
+    Body.Group - already in Tip order - for the next solid feature after
+    `feature`. Returns None if feature isn't in the body or is the last
+    solid feature.
+    """
+    objects = list(body.Group)
+    if feature not in objects:
+        return None
+    for obj in objects[objects.index(feature) + 1 :]:
+        if is_solid_feature(obj):
+            return obj
+    return None
+
+
+def get_prev_solid_feature(body, feature):
+    """Python reimplementation of PartDesign::Body::getPrevSolidFeature().
+
+    See get_next_solid_feature() - same C++-only-API situation, walking
+    backwards instead.
+    """
+    objects = list(body.Group)
+    if feature not in objects:
+        return None
+    for obj in reversed(objects[: objects.index(feature)]):
+        if is_solid_feature(obj):
+            return obj
+    return None
+
+
+def find_downstream_dressup_risk(body) -> list:
+    """Dressup features (Chamfer/Fillet/Draft) directly consuming the
+    Body's current Tip.
+
+    These are exactly the features Body.insertObject() would relink to
+    a newly-inserted feature (per Body.cpp's setBaseProperty(), verified
+    in the M3 spike), and so the ones at real risk of the Topological
+    Naming Problem if something is inserted at the rollback bar right
+    now - reuses find_dependents(), the same InList-based lookup already
+    powering the Suppress/Delete impact warning, rather than a new
+    lookup mechanism.
+    """
+    tip = body.Tip
+    if tip is None:
+        return []
+    return [obj for obj in find_dependents(tip) if obj.TypeId in _DRESSUP_TYPE_IDS]
+
+
+def move_rollback_bar(doc, body, feature) -> None:
+    """Move the Body's Tip - the rollback bar's position - to feature.
+
+    Wrapped in a transaction like every other document-mutating
+    operation in this module; recompute happens inside it so a failed
+    recompute aborts the Tip change too rather than leaving the document
+    half-updated.
+    """
+    doc.openTransaction(f"Move rollback bar to {feature.Label}")
+    try:
+        body.Tip = feature
+        doc.recompute()
+    except Exception:
+        doc.abortTransaction()
+        raise
+    doc.commitTransaction()
+
+
+def insert_feature_at_rollback_bar(doc, body, new_feature, sketch=None) -> None:
+    """Insert new_feature (and its sketch, if any) right after the
+    current Tip, then advance Tip to new_feature.
+
+    Body.insertObject() handles the ordering and BaseFeature relinking
+    on its own (verified in the M3 spike) but deliberately does not
+    touch Tip - that half is ours to do, in the same transaction so a
+    partial insert (e.g. a failed recompute) can't leave Tip pointing at
+    a feature that didn't actually get inserted where expected.
+    """
+    tip = body.Tip
+    doc.openTransaction(f"Insert {new_feature.Label} at rollback bar")
+    try:
+        if sketch is not None:
+            body.insertObject(sketch, tip, True)
+        body.insertObject(new_feature, tip, True)
+        body.Tip = new_feature
+        doc.recompute()
+    except Exception:
+        doc.abortTransaction()
+        raise
+    doc.commitTransaction()

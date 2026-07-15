@@ -534,6 +534,14 @@ def test_header_toggle_persists_and_gates_highlighting():
             )
 
             panel._selected_highlight_name = "Pad001"
+
+            # Force a known starting state (checked) for the functional
+            # assertions below, regardless of whatever `original` happens
+            # to be - this block tests the toggle's *behavior*, not its
+            # ambient starting value (which any other test, or a human
+            # running this suite, could legitimately have left as off).
+            panel._hover_highlight_action.setChecked(True)
+            assert is_hover_highlight_enabled() is True
             panel._apply_highlight("Pad001")
             assert len(panel._highlighted_items) == 3
 
@@ -553,6 +561,230 @@ def test_header_toggle_persists_and_gates_highlighting():
             App.closeDocument(doc.Name)
     finally:
         set_hover_highlight_enabled(original)
+
+
+def test_rollback_bar_move_and_beyond_tip_state():
+    """Moving the rollback bar backward must be reflected in
+    beyond_tip/get_next_solid_feature/get_prev_solid_feature, and moving
+    it forward again must not corrupt the document (per the M3 spike -
+    docs/spike_rollback_findings.md).
+
+    Uses a temp-directory copy of 02_complex.FCStd, never the reference
+    file itself; its mtime is asserted unchanged at the end.
+    """
+    from atpd.tree.model import (
+        collect_body_features,
+        get_next_solid_feature,
+        get_prev_solid_feature,
+        move_rollback_bar,
+    )
+
+    src = os.path.join(_REFERENCE_FILES_DIR, "02_complex.FCStd")
+    mtime_before = os.path.getmtime(src)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        copy_path = os.path.join(tmp_dir, "02_complex_copy.FCStd")
+        shutil.copyfile(src, copy_path)
+
+        doc = App.openDocument(copy_path)
+        try:
+            body = next(obj for obj in doc.Objects if obj.TypeId == "PartDesign::Body")
+            pocket = doc.getObject("Pocket")
+            fillet = doc.getObject("Fillet")
+
+            assert get_next_solid_feature(body, pocket).Name == "Chamfer"
+            assert get_prev_solid_feature(body, pocket).Name == "Pad002"
+
+            rows = collect_body_features(body)
+            assert not any(row.beyond_tip for row in rows), (
+                "nothing should be beyond Tip before moving it (Tip starts at the last feature)"
+            )
+
+            move_rollback_bar(doc, body, pocket)
+            assert body.Tip.Name == "Pocket"
+
+            rows = collect_body_features(body)
+            beyond_names = {row.name for row in rows if row.beyond_tip}
+            assert "Chamfer" in beyond_names and "Pocket" not in beyond_names
+
+            # moving forward again must not raise, and the document
+            # graph must stay consistent (same objects, same count) -
+            # even though nothing was inserted here so there's no TNP
+            # risk to reproduce in this particular test.
+            move_rollback_bar(doc, body, fillet)
+            assert body.Tip.Name == "Fillet"
+            rows = collect_body_features(body)
+            assert not any(row.beyond_tip for row in rows)
+        finally:
+            App.closeDocument(doc.Name)
+
+    assert os.path.getmtime(src) == mtime_before, "reference file must never be modified"
+
+
+def test_insert_feature_at_rollback_bar():
+    """The exact scenario from issue #37's step 3: move the rollback bar
+    back before a Dress-Up feature, confirm the TNP-risk check would
+    fire, insert a new feature there, and confirm the document survives
+    a full recompute afterward (with the known, expected TNP breakage on
+    the downstream Chamfer - reproducing the M3 spike's finding, not a
+    new failure).
+
+    Calls insert_feature_at_rollback_bar() directly rather than going
+    through FeatureTreePanel._insert_feature_with_rollback_warning():
+    that path shows a real QMessageBox.warning() when risk is found,
+    which would block waiting for input under the offscreen platform
+    with nothing to dismiss it - not something to exercise here. The
+    warning's *data* (find_downstream_dressup_risk()) is asserted
+    directly instead.
+
+    Uses a temp-directory copy of 02_complex.FCStd, never the reference
+    file itself; its mtime is asserted unchanged at the end.
+    """
+    import Part
+
+    from atpd.tree.model import (
+        find_downstream_dressup_risk,
+        insert_feature_at_rollback_bar,
+        move_rollback_bar,
+    )
+
+    src = os.path.join(_REFERENCE_FILES_DIR, "02_complex.FCStd")
+    mtime_before = os.path.getmtime(src)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        copy_path = os.path.join(tmp_dir, "02_complex_copy.FCStd")
+        shutil.copyfile(src, copy_path)
+
+        doc = App.openDocument(copy_path)
+        try:
+            body = next(obj for obj in doc.Objects if obj.TypeId == "PartDesign::Body")
+            pocket = doc.getObject("Pocket")
+            chamfer = doc.getObject("Chamfer")
+            original_object_count = len(doc.Objects)
+
+            move_rollback_bar(doc, body, pocket)
+
+            at_risk = find_downstream_dressup_risk(body)
+            assert [obj.Name for obj in at_risk] == ["Chamfer"], (
+                "the TNP warning must fire for exactly the Dress-Up feature "
+                "immediately downstream of the new Tip"
+            )
+
+            sketch = doc.addObject("Sketcher::SketchObject", "TestSketch")
+            sketch.addGeometry(Part.Circle(App.Vector(0, 0, 0), App.Vector(0, 0, 1), 5), False)
+            pad = doc.addObject("PartDesign::Pad", "TestPad")
+            pad.Profile = sketch
+            pad.Length = 5.0
+
+            insert_feature_at_rollback_bar(doc, body, pad, sketch)
+
+            assert body.Tip.Name == "TestPad", "Tip must advance to the newly inserted feature"
+            assert len(doc.Objects) == original_object_count + 2
+            group_names = [obj.Name for obj in body.Group]
+            assert group_names.index("Pocket") < group_names.index("TestPad") < group_names.index(
+                "Chamfer"
+            ), "the new feature must land between Pocket and Chamfer"
+
+            # advance back to the end - must not crash the recompute,
+            # even though Chamfer is expected to end up genuinely
+            # Invalid (the TNP, reproduced from the spike - this is the
+            # documented, expected risk, not a bug in this test)
+            fillet = doc.getObject("Fillet")
+            move_rollback_bar(doc, body, fillet)
+            assert body.Tip.Name == "Fillet"
+            assert chamfer.isValid() is False, (
+                "expected Chamfer to break per the M3 spike's TNP finding - "
+                "if this now passes, either FreeCAD's topological naming "
+                "handling improved or something else changed; worth a look"
+            )
+        finally:
+            App.closeDocument(doc.Name)
+
+    assert os.path.getmtime(src) == mtime_before, "reference file must never be modified"
+
+
+def test_panel_rollback_bar_widget_and_no_risk_insert():
+    """Panel-level integration: the rollback-bar row is inserted at the
+    right position in the tree, and
+    _insert_feature_with_rollback_warning() succeeds without popping a
+    dialog when there's nothing downstream to warn about (Tip already at
+    the last feature) - safe to exercise under the offscreen platform
+    since no QMessageBox is shown on this path.
+
+    (The *with-risk* path, which does show a real QMessageBox.warning(),
+    is intentionally not exercised here - see
+    test_insert_feature_at_rollback_bar()'s docstring for why.)
+
+    Uses a temp-directory copy of 02_complex.FCStd, never the reference
+    file itself; its mtime is asserted unchanged at the end.
+    """
+    import Part
+    from PySide6 import QtWidgets
+
+    import atpd.tree.panel as panel_module
+    from atpd.tree.model import collect_body_features
+    from atpd.tree.panel import _IS_ROLLBACK_BAR_ROLE, FeatureTreePanel, _make_item
+
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    src = os.path.join(_REFERENCE_FILES_DIR, "02_complex.FCStd")
+    mtime_before = os.path.getmtime(src)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        copy_path = os.path.join(tmp_dir, "02_complex_copy.FCStd")
+        shutil.copyfile(src, copy_path)
+
+        doc = App.openDocument(copy_path)
+        real_active_body = panel_module._active_body
+        try:
+            body = next(obj for obj in doc.Objects if obj.TypeId == "PartDesign::Body")
+            pocket = doc.getObject("Pocket")
+            body.Tip = pocket
+            doc.recompute()
+
+            panel = FeatureTreePanel.__new__(FeatureTreePanel)
+            panel._tree = QtWidgets.QTreeWidget()
+            panel._tree.setColumnCount(2)
+            panel._items_by_name = {}
+            panel._highlighted_items = []
+            panel._selected_highlight_name = None
+            panel._isolated_name = None
+            panel._isolated_saved_visibility = {}
+            for row in collect_body_features(body):
+                panel._tree.addTopLevelItem(_make_item(row, panel._items_by_name))
+            panel._insert_rollback_bar(body)
+
+            pocket_index = panel._tree.indexOfTopLevelItem(panel._items_by_name["Pocket"])
+            bar_item = panel._tree.topLevelItem(pocket_index + 1)
+            assert bar_item is not None and bar_item.data(0, _IS_ROLLBACK_BAR_ROLE) is True, (
+                "the rollback bar row must sit right after Tip's top-level item"
+            )
+
+            # _active_body() resolves via Gui, unavailable under
+            # FreeCADCmd - stand in the already-open document's body
+            # directly, same technique used by the dependency-highlight
+            # and header-toggle tests.
+            panel_module._active_body = lambda: body
+            panel.refresh = lambda: None
+
+            fillet = doc.getObject("Fillet")
+            body.Tip = fillet
+            doc.recompute()
+
+            sketch = doc.addObject("Sketcher::SketchObject", "PanelTestSketch")
+            sketch.addGeometry(Part.Circle(App.Vector(0, 0, 0), App.Vector(0, 0, 1), 5), False)
+            pad = doc.addObject("PartDesign::Pad", "PanelTestPad")
+            pad.Profile = sketch
+            pad.Length = 5.0
+
+            result = panel._insert_feature_with_rollback_warning(pad, sketch)
+            assert result is True
+            assert body.Tip.Name == "PanelTestPad"
+        finally:
+            panel_module._active_body = real_active_body
+            App.closeDocument(doc.Name)
+
+    assert os.path.getmtime(src) == mtime_before, "reference file must never be modified"
 
 
 def _collect_tests():

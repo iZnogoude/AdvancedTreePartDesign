@@ -25,9 +25,13 @@ from .model import (
     dissolve_group,
     find_dependencies,
     find_dependents,
+    find_downstream_dressup_risk,
+    insert_feature_at_rollback_bar,
     is_hover_highlight_enabled,
+    is_solid_feature,
     isolate_object,
     load_groups,
+    move_rollback_bar,
     move_to_group,
     rename_group,
     rename_label,
@@ -38,6 +42,7 @@ from .model import (
 
 _NAME_ROLE = QtCore.Qt.ItemDataRole.UserRole
 _IS_GROUP_ROLE = QtCore.Qt.ItemDataRole.UserRole + 1
+_IS_ROLLBACK_BAR_ROLE = QtCore.Qt.ItemDataRole.UserRole + 2
 
 # Alpha values for the dependency-highlight background, applied to the
 # palette's own Highlight color rather than a hardcoded RGB - stays
@@ -141,7 +146,25 @@ def _make_item(
     # next refresh() silently overwrites back to the real type.
     item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsEditable)
 
-    if row.state == SUPPRESSED:
+    if row.beyond_tip:
+        # Distinct from Suppressed on purpose (CDC 3.1 calls for a
+        # visually different "beyond the rollback bar" state, not a
+        # reuse of Suppressed's styling) - strikeout instead of italic,
+        # and the palette's PlaceholderText role instead of Disabled/
+        # Text, so the two are never confused even though both are some
+        # shade of gray. Still theme-derived, never a hardcoded color.
+        # A feature beyond the bar hasn't been part of the last
+        # recompute, so its Suppressed/Error status isn't the relevant
+        # thing to show right now - this takes priority over that below.
+        placeholder_text = QtWidgets.QApplication.palette().color(
+            QtGui.QPalette.ColorGroup.Active, QtGui.QPalette.ColorRole.PlaceholderText
+        )
+        for column in (0, 1):
+            font = item.font(column)
+            font.setStrikeOut(True)
+            item.setFont(column, font)
+            item.setForeground(column, placeholder_text)
+    elif row.state == SUPPRESSED:
         # Never hardcode a color: a gray that reads fine in a light theme
         # can be unreadable in a dark one. Read the *current* palette's
         # disabled-text color instead - theme-safe without hardcoding
@@ -166,6 +189,24 @@ def _make_item(
     for child in row.children:
         item.addChild(_make_item(child, registry))
     return item
+
+
+def _make_rollback_bar_item() -> QtWidgets.QTreeWidgetItem:
+    """A non-selectable row rendered as an actual horizontal line -
+    the rollback bar itself, distinct from styling applied to a feature
+    row (see FeatureRow.beyond_tip in _make_item above)."""
+    item = QtWidgets.QTreeWidgetItem()
+    item.setFlags(QtCore.Qt.ItemFlag.NoItemFlags)
+    item.setData(0, _IS_ROLLBACK_BAR_ROLE, True)
+    return item
+
+
+def _make_rollback_bar_widget() -> QtWidgets.QWidget:
+    frame = QtWidgets.QFrame()
+    frame.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+    frame.setFrameShadow(QtWidgets.QFrame.Shadow.Sunken)
+    frame.setLineWidth(2)
+    return frame
 
 
 class FeatureTreePanel(QtWidgets.QDockWidget):
@@ -287,11 +328,37 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
             )
             for row in rows:
                 self._tree.addTopLevelItem(_make_item(row, self._items_by_name))
+            self._insert_rollback_bar(body)
             self._tree.expandAll()
             self._tree.resizeColumnToContents(0)
             self._tree.resizeColumnToContents(1)
         finally:
             self._tree.blockSignals(False)
+
+    def _insert_rollback_bar(self, body) -> None:
+        """Insert the rollback-bar row right after the Tip's top-level item.
+
+        The Tip is always a solid feature, never nestable (see
+        is_solid_feature()), but it can be inside one of our own group
+        folders - walk up to that folder's own top-level item in that
+        case, since the bar itself is always a top-level row.
+        """
+        tip = body.Tip
+        if tip is None:
+            return
+        tip_item = self._items_by_name.get(tip.Name)
+        if tip_item is None:
+            return
+
+        top_level_item = tip_item
+        while top_level_item.parent() is not None:
+            top_level_item = top_level_item.parent()
+        index = self._tree.indexOfTopLevelItem(top_level_item)
+
+        bar_item = _make_rollback_bar_item()
+        self._tree.insertTopLevelItem(index + 1, bar_item)
+        self._tree.setFirstColumnSpanned(index + 1, QtCore.QModelIndex(), True)
+        self._tree.setItemWidget(bar_item, 0, _make_rollback_bar_widget())
 
     def closeEvent(self, event: QtCore.QEvent) -> None:
         Gui.removeDocumentObserver(self._observer)
@@ -345,7 +412,7 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
         return super().eventFilter(watched, event)
 
     def _on_item_hover(self, item: QtWidgets.QTreeWidgetItem, column: int) -> None:
-        if item.data(0, _IS_GROUP_ROLE):
+        if item.data(0, _IS_GROUP_ROLE) or item.data(0, _IS_ROLLBACK_BAR_ROLE):
             return
         self._apply_highlight(item.data(0, _NAME_ROLE))
 
@@ -426,7 +493,7 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
         resolve; Qt's own default expand/collapse-on-double-click already
         applies to it, so there's nothing extra to do here.
         """
-        if item.data(0, _IS_GROUP_ROLE):
+        if item.data(0, _IS_GROUP_ROLE) or item.data(0, _IS_ROLLBACK_BAR_ROLE):
             return
         obj = self._resolve_object(item)
         if obj is None:
@@ -447,7 +514,7 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
 
     def _on_context_menu(self, pos: QtCore.QPoint) -> None:
         item = self._tree.itemAt(pos)
-        if item is None:
+        if item is None or item.data(0, _IS_ROLLBACK_BAR_ROLE):
             return
 
         selected = self._tree.selectedItems()
@@ -524,6 +591,16 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
         )
 
         body = _active_body()
+
+        move_bar_action = None
+        if (
+            body is not None
+            and is_solid_feature(obj)
+            and (body.Tip is None or obj.Name != body.Tip.Name)
+        ):
+            menu.addSeparator()
+            move_bar_action = menu.addAction("Move Rollback Bar Here")
+
         groups, membership = load_groups(body) if body is not None else ({}, {})
         move_actions: dict[QtGui.QAction, str | None] = {}
         if groups:
@@ -552,6 +629,8 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
             self._goto_sketch(sketch_child)
         elif chosen is isolate_action:
             self._toggle_isolate(obj)
+        elif chosen is move_bar_action:
+            self._move_rollback_bar(obj)
         elif chosen in move_actions:
             self._move_feature(obj, move_actions[chosen])
 
@@ -751,6 +830,81 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
         App.Console.PrintMessage(f"ATPD tree DEBUG: isolating {obj.Name}\n")
         self._isolated_saved_visibility = isolate_object(body.Group, obj)
         self._isolated_name = obj.Name
+
+    def _move_rollback_bar(self, obj) -> None:
+        """Move the Body's Tip - the rollback bar's position - to obj.
+
+        Moving alone never breaks anything (verified in the M3 spike -
+        docs/spike_rollback_findings.md): the Topological Naming Problem
+        risk only appears if something is later *inserted* at the new
+        position, which is warned about separately in
+        _insert_feature_with_rollback_warning() below - not here.
+        """
+        body = _active_body()
+        if body is None:
+            return
+        try:
+            move_rollback_bar(body.Document, body, obj)
+        except Exception as exc:
+            App.Console.PrintError(f"ATPD tree: failed to move rollback bar to {obj.Name}: {exc}\n")
+            QtWidgets.QMessageBox.critical(
+                self, "Error", f'Failed to move rollback bar to "{obj.Label}":\n{exc}'
+            )
+            return
+        App.Console.PrintMessage(f"ATPD tree DEBUG: rollback bar moved to {obj.Name}\n")
+        self.refresh()
+
+    def _insert_feature_with_rollback_warning(self, new_feature, sketch=None) -> bool:
+        """Insert new_feature (and its sketch, if any) at the current
+        rollback bar, warning first if a Dress-Up feature immediately
+        downstream of the Tip is at risk of FreeCAD's Topological Naming
+        Problem (docs/spike_rollback_findings.md).
+
+        Not wired to a context-menu entry yet - actually creating a new
+        feature (a sketch + Pad/Pocket/etc.) is out of scope for the
+        rollback bar itself (M4's unified feature commands are the
+        intended caller once they exist). This is the reusable building
+        block for that, exercised directly by this PR's tests in the
+        meantime. Returns whether the insertion actually happened
+        (False if cancelled, or the body couldn't be resolved).
+        """
+        body = _active_body()
+        if body is None:
+            return False
+
+        at_risk = find_downstream_dressup_risk(body)
+        if at_risk:
+            names = ", ".join(feature.Label for feature in at_risk)
+            reply = QtWidgets.QMessageBox.warning(
+                self,
+                "Topological naming risk",
+                f"Inserting a feature here may invalidate the following "
+                f"Dress-Up feature(s), which reference specific edges/faces "
+                f"of the shape at this point: {names}.\n\n"
+                f"This is a known FreeCAD kernel limitation (the "
+                f"Topological Naming Problem), not something ATPD can "
+                f"prevent - see docs/spike_rollback_findings.md.\n\nContinue?",
+                QtWidgets.QMessageBox.StandardButton.Ok
+                | QtWidgets.QMessageBox.StandardButton.Cancel,
+            )
+            if reply != QtWidgets.QMessageBox.StandardButton.Ok:
+                App.Console.PrintMessage("ATPD tree DEBUG: insert at rollback bar cancelled\n")
+                return False
+
+        try:
+            insert_feature_at_rollback_bar(body.Document, body, new_feature, sketch)
+        except Exception as exc:
+            App.Console.PrintError(
+                f"ATPD tree: failed to insert {new_feature.Name} at rollback bar: {exc}\n"
+            )
+            QtWidgets.QMessageBox.critical(
+                self, "Error", f'Failed to insert "{new_feature.Label}":\n{exc}'
+            )
+            return False
+
+        App.Console.PrintMessage(f"ATPD tree DEBUG: inserted {new_feature.Name} at rollback bar\n")
+        self.refresh()
+        return True
 
     def _group_into_folder(self, member_names: list[str]) -> None:
         body = _active_body()
