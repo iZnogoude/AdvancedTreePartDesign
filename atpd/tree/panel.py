@@ -20,8 +20,11 @@ from .model import (
     FeatureRow,
     collect_body_features,
     count_rows,
+    delete_objects,
     find_dependents,
+    isolate_object,
     rename_label,
+    restore_visibilities,
     toggle_suppressed,
 )
 
@@ -123,8 +126,11 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
     """Dockable view of the active Body's feature chain.
 
     Read-only display plus a few interactions:
-    - double-click or right-click a feature to suppress/unsuppress it
+    - double-click a feature to edit it (same as the context menu's Edit)
     - F2, or clicking an already-selected feature, to rename it inline
+    - right-click for the full menu: Suppress/Unsuppress, Edit, Delete,
+      Delete with Children, Go to Sketch (only if the feature has one),
+      Isolate/Restore Visibility
     """
 
     def __init__(self, parent=None):
@@ -140,7 +146,10 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
         # EditKeyPressed = F2. SelectedClicked = clicking an item that is
         # already selected, same convention native file explorers use for
         # rename - deliberately *not* DoubleClicked, which already means
-        # suppress/unsuppress here (see _on_item_double_clicked).
+        # Edit here (see _on_item_double_clicked), matching both the
+        # native tree and file-explorer conventions: a fast double-click
+        # opens/edits, a slow second click on an already-selected item
+        # renames.
         self._tree.setEditTriggers(
             QtWidgets.QAbstractItemView.EditTrigger.EditKeyPressed
             | QtWidgets.QAbstractItemView.EditTrigger.SelectedClicked
@@ -150,6 +159,12 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
 
         self._observer = _TreeDocumentObserver(self.refresh)
         Gui.addDocumentObserver(self._observer)
+
+        # Isolate/restore-visibility toggle state - which object (if any)
+        # is currently isolated, and the visibility every object in the
+        # body had right before that, so a second click can undo it.
+        self._isolated_name: str | None = None
+        self._isolated_saved_visibility: dict[str, bool] = {}
 
         App.Console.PrintMessage("ATPD tree DEBUG: panel __init__, running initial refresh()\n")
         self.refresh()
@@ -195,29 +210,70 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
         return doc.getObject(name)
 
     def _on_item_double_clicked(self, item: QtWidgets.QTreeWidgetItem, column: int) -> None:
-        self._try_toggle_suppress(item)
+        """Fast double-click means Edit - Suppress/Unsuppress is context-menu only."""
+        obj = self._resolve_object(item)
+        if obj is None:
+            App.Console.PrintMessage("ATPD tree DEBUG: double-click on an unresolved item\n")
+            return
+        self._edit_object(obj)
+
+    def _find_sketch_child(
+        self, item: QtWidgets.QTreeWidgetItem
+    ) -> QtWidgets.QTreeWidgetItem | None:
+        """The item's direct child that represents a Sketch, if any."""
+        for i in range(item.childCount()):
+            child_item = item.child(i)
+            child_obj = self._resolve_object(child_item)
+            if child_obj is not None and child_obj.TypeId == "Sketcher::SketchObject":
+                return child_item
+        return None
 
     def _on_context_menu(self, pos: QtCore.QPoint) -> None:
         item = self._tree.itemAt(pos)
         obj = self._resolve_object(item) if item is not None else None
-        if obj is None or not hasattr(obj, "Suppressed"):
+        if obj is None:
             return
 
         menu = QtWidgets.QMenu(self._tree)
-        label = "Unsuppress" if obj.Suppressed else "Suppress"
-        action = menu.addAction(label)
-        chosen = menu.exec(self._tree.viewport().mapToGlobal(pos))
-        if chosen is action:
-            self._toggle_suppress(obj)
 
-    def _try_toggle_suppress(self, item: QtWidgets.QTreeWidgetItem) -> None:
-        obj = self._resolve_object(item)
-        if obj is None or not hasattr(obj, "Suppressed"):
-            App.Console.PrintMessage(
-                "ATPD tree DEBUG: double-click on a non-suppressible item, ignored\n"
-            )
+        suppress_action = None
+        if hasattr(obj, "Suppressed"):
+            suppress_action = menu.addAction("Unsuppress" if obj.Suppressed else "Suppress")
+
+        edit_action = menu.addAction("Edit")
+
+        menu.addSeparator()
+        delete_action = menu.addAction("Delete")
+        delete_children_action = (
+            menu.addAction("Delete with Children") if item.childCount() > 0 else None
+        )
+
+        sketch_child = self._find_sketch_child(item)
+        goto_sketch_action = None
+        if sketch_child is not None:
+            menu.addSeparator()
+            goto_sketch_action = menu.addAction("Go to Sketch")
+
+        menu.addSeparator()
+        isolate_action = menu.addAction(
+            "Restore Visibility" if self._isolated_name == obj.Name else "Isolate"
+        )
+
+        chosen = menu.exec(self._tree.viewport().mapToGlobal(pos))
+        if chosen is None:
             return
-        self._toggle_suppress(obj)
+        if chosen is suppress_action:
+            self._toggle_suppress(obj)
+        elif chosen is edit_action:
+            self._edit_object(obj)
+        elif chosen is delete_action:
+            self._delete_object(obj)
+        elif chosen is delete_children_action:
+            self._delete_object_with_children(item, obj)
+        elif chosen is goto_sketch_action:
+            self._goto_sketch(sketch_child)
+        elif chosen is isolate_action:
+            self._toggle_isolate(obj)
 
     def _toggle_suppress(self, obj) -> None:
         """Suppress/unsuppress obj, warning about dependents first if any."""
@@ -287,3 +343,128 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
                 f"restoring {obj.Label!r}\n"
             )
             item.setText(0, obj.Label)
+
+    def _edit_object(self, obj) -> None:
+        """Open obj in its native edit dialog - the same mechanism a
+        double-click on its icon triggers in the native tree."""
+        gui_doc = Gui.ActiveDocument
+        if gui_doc is None:
+            return
+        App.Console.PrintMessage(f"ATPD tree DEBUG: setEdit({obj.Name})\n")
+        gui_doc.setEdit(obj.Name)
+
+    def _delete_object(self, obj) -> None:
+        """Permanently delete obj (not Suppress), after confirmation."""
+        dependents = find_dependents(obj)
+        App.Console.PrintMessage(
+            f"ATPD tree DEBUG: delete requested for {obj.Name}, "
+            f"{len(dependents)} dependent(s)\n"
+        )
+        text = f'Permanently delete "{obj.Label}"?\n\nThis action is irreversible.'
+        if dependents:
+            names = ", ".join(dep.Label for dep in dependents)
+            text += f"\n\nDependent feature(s) that may break: {names}."
+
+        reply = QtWidgets.QMessageBox.warning(
+            self,
+            "Confirm delete",
+            text,
+            QtWidgets.QMessageBox.StandardButton.Ok | QtWidgets.QMessageBox.StandardButton.Cancel,
+        )
+        if reply != QtWidgets.QMessageBox.StandardButton.Ok:
+            App.Console.PrintMessage("ATPD tree DEBUG: delete cancelled by user\n")
+            return
+
+        try:
+            delete_objects(obj.Document, [obj.Name])
+        except Exception as exc:
+            App.Console.PrintError(f"ATPD tree: failed to delete {obj.Name}: {exc}\n")
+            QtWidgets.QMessageBox.critical(self, "Error", f'Failed to delete "{obj.Label}":\n{exc}')
+            return
+
+        App.Console.PrintMessage(f"ATPD tree DEBUG: deleted {obj.Name}\n")
+        self.refresh()
+
+    def _delete_object_with_children(
+        self, item: QtWidgets.QTreeWidgetItem, obj
+    ) -> None:
+        """Permanently delete obj and its direct children, after confirmation."""
+        children = [
+            child_obj
+            for i in range(item.childCount())
+            if (child_obj := self._resolve_object(item.child(i))) is not None
+        ]
+        dependents = find_dependents(obj)
+        App.Console.PrintMessage(
+            f"ATPD tree DEBUG: delete-with-children requested for {obj.Name}, "
+            f"{len(children)} child(ren), {len(dependents)} other dependent(s)\n"
+        )
+
+        child_labels = ", ".join(child.Label for child in children)
+        text = (
+            f'Permanently delete "{obj.Label}" and its {len(children)} child feature(s) '
+            f"({child_labels})?\n\nThis action is irreversible."
+        )
+        if dependents:
+            names = ", ".join(dep.Label for dep in dependents)
+            text += f"\n\nOther dependent feature(s) that may break: {names}."
+
+        reply = QtWidgets.QMessageBox.warning(
+            self,
+            "Confirm delete with children",
+            text,
+            QtWidgets.QMessageBox.StandardButton.Ok | QtWidgets.QMessageBox.StandardButton.Cancel,
+        )
+        if reply != QtWidgets.QMessageBox.StandardButton.Ok:
+            App.Console.PrintMessage("ATPD tree DEBUG: delete-with-children cancelled by user\n")
+            return
+
+        try:
+            delete_objects(obj.Document, [child.Name for child in children] + [obj.Name])
+        except Exception as exc:
+            App.Console.PrintError(
+                f"ATPD tree: failed to delete {obj.Name} with children: {exc}\n"
+            )
+            QtWidgets.QMessageBox.critical(
+                self, "Error", f'Failed to delete "{obj.Label}" with children:\n{exc}'
+            )
+            return
+
+        App.Console.PrintMessage(
+            f"ATPD tree DEBUG: deleted {obj.Name} and {len(children)} child(ren)\n"
+        )
+        self.refresh()
+
+    def _goto_sketch(self, sketch_item: QtWidgets.QTreeWidgetItem) -> None:
+        """Select and reveal a feature's sketch, in both trees, without editing it."""
+        obj = self._resolve_object(sketch_item)
+        if obj is None:
+            return
+        App.Console.PrintMessage(f"ATPD tree DEBUG: go to sketch {obj.Name}\n")
+        self._tree.setCurrentItem(sketch_item)
+        self._tree.scrollToItem(sketch_item)
+        Gui.Selection.clearSelection()
+        Gui.Selection.addSelection(obj.Document.Name, obj.Name)
+
+    def _toggle_isolate(self, obj) -> None:
+        """Hide every other object in the Body, or restore visibility.
+
+        Purely visual (ViewObject.Visibility) - never touches Suppressed,
+        and needs no transaction since it isn't a document-structure
+        change.
+        """
+        if self._isolated_name == obj.Name:
+            App.Console.PrintMessage(
+                f"ATPD tree DEBUG: restoring visibility (was isolating {obj.Name})\n"
+            )
+            restore_visibilities(obj.Document, self._isolated_saved_visibility)
+            self._isolated_name = None
+            self._isolated_saved_visibility = {}
+            return
+
+        body = _active_body()
+        if body is None:
+            return
+        App.Console.PrintMessage(f"ATPD tree DEBUG: isolating {obj.Name}\n")
+        self._isolated_saved_visibility = isolate_object(body.Group, obj)
+        self._isolated_name = obj.Name

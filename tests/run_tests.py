@@ -277,6 +277,66 @@ def test_rename_label():
     assert os.path.getmtime(src) == mtime_before, "reference file must never be modified"
 
 
+def test_delete_objects():
+    """delete_objects() must remove every listed object inside one
+    transaction, including the feature-plus-its-children pattern used by
+    the "Delete with Children" context-menu action.
+
+    Uses a temp-directory copy of 01_simple.FCStd, never the reference
+    file itself; its mtime is asserted unchanged at the end.
+    """
+    from atpd.tree.model import delete_objects
+
+    src = os.path.join(_REFERENCE_FILES_DIR, "01_simple.FCStd")
+    mtime_before = os.path.getmtime(src)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        copy_path = os.path.join(tmp_dir, "01_simple_copy.FCStd")
+        shutil.copyfile(src, copy_path)
+
+        doc = App.openDocument(copy_path)
+        try:
+            assert doc.getObject("Fillet001") is not None
+            delete_objects(doc, ["Fillet001"])
+            assert doc.getObject("Fillet001") is None
+
+            assert doc.getObject("Pad") is not None
+            assert doc.getObject("Sketch002") is not None
+            delete_objects(doc, ["Sketch002", "Pad"])
+            assert doc.getObject("Pad") is None
+            assert doc.getObject("Sketch002") is None
+        finally:
+            App.closeDocument(doc.Name)
+
+    assert os.path.getmtime(src) == mtime_before, "reference file must never be modified"
+
+
+def test_isolate_object_degrades_gracefully_headlessly():
+    """isolate_object()/restore_visibilities() must not crash without a Gui
+    session.
+
+    Every object's ViewObject is None under FreeCADCmd (no Gui), so these
+    degrade to a no-op rather than raising - isolating is a visual
+    convenience with nothing to roll back if it can't act. This can only
+    verify the headless-degradation path; the actual visibility toggling
+    needs a real Gui session to observe.
+    """
+    from atpd.tree.model import isolate_object, restore_visibilities
+
+    doc = App.openDocument(os.path.join(_REFERENCE_FILES_DIR, "01_simple.FCStd"))
+    try:
+        body = next(obj for obj in doc.Objects if obj.TypeId == "PartDesign::Body")
+        target = doc.getObject("Pad")
+        assert target.ViewObject is None, "expected no ViewObject under FreeCADCmd"
+
+        saved = isolate_object(body.Group, target)
+        assert saved == {}, "no ViewObject anywhere means nothing to save"
+
+        restore_visibilities(doc, saved)  # must not raise
+    finally:
+        App.closeDocument(doc.Name)
+
+
 def _collect_tests():
     module = sys.modules[__name__]
     return [

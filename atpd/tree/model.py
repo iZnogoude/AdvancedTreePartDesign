@@ -241,3 +241,51 @@ def rename_label(doc, obj, new_label: str) -> bool:
         raise
     doc.commitTransaction()
     return True
+
+
+def delete_objects(doc, names: list[str]) -> None:
+    """Remove multiple objects by name inside a single transaction.
+
+    All-or-nothing: any exception aborts the whole transaction and
+    re-raises, so a partially-completed delete never lingers. Order
+    matters only in that it's applied as given - callers wanting a
+    feature's children gone first should list them before the feature.
+    """
+    doc.openTransaction("Delete " + ", ".join(names))
+    try:
+        for name in names:
+            doc.removeObject(name)
+        doc.recompute()
+    except Exception:
+        doc.abortTransaction()
+        raise
+    doc.commitTransaction()
+
+
+def isolate_object(body_objects, obj) -> dict[str, bool]:
+    """Hide every object's ViewObject except obj's.
+
+    Returns the prior visibility state (name -> bool) so it can be
+    restored later via restore_visibilities(). No-op for any object
+    lacking a ViewObject (e.g. no Gui session, such as FreeCADCmd), and
+    for the whole call if that applies to everything - it degrades to
+    doing nothing rather than raising, since isolating is purely a
+    visual convenience with nothing to roll back if it can't act.
+    """
+    previous = {}
+    for other in body_objects:
+        view_object = getattr(other, "ViewObject", None)
+        if view_object is None:
+            continue
+        previous[other.Name] = view_object.Visibility
+        view_object.Visibility = other.Name == obj.Name
+    return previous
+
+
+def restore_visibilities(doc, previous: dict[str, bool]) -> None:
+    """Undo isolate_object(): reapply each object's saved Visibility."""
+    for name, visible in previous.items():
+        obj = doc.getObject(name)
+        view_object = getattr(obj, "ViewObject", None) if obj is not None else None
+        if view_object is not None:
+            view_object.Visibility = visible
