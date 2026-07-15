@@ -1,11 +1,8 @@
 """Workbench command that opens the ATPD read-only feature tree panel."""
 
 import FreeCADGui as Gui
-from PySide6 import QtCore
 
-from .panel import FeatureTreePanel
-
-_panel = None
+from .panel import get_or_create_panel
 
 
 class ShowFeatureTreeCommand:
@@ -18,13 +15,9 @@ class ShowFeatureTreeCommand:
         }
 
     def Activated(self):
-        global _panel
-        main_window = Gui.getMainWindow()
-        if _panel is None:
-            _panel = FeatureTreePanel(main_window)
-            main_window.addDockWidget(QtCore.Qt.RightDockWidgetArea, _panel)
-        _panel.show()
-        _panel.raise_()
+        panel = get_or_create_panel(Gui.getMainWindow())
+        panel.show()
+        panel.raise_()
 
     def IsActive(self):
         return True

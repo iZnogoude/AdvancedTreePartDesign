@@ -20,9 +20,14 @@ class ATPDWorkbench(Gui.Workbench):
 
     def Initialize(self):
         """Register commands and menus."""
+        from atpd.features import extrude_command  # noqa: F401  (registers ATPD_UnifiedExtrude)
         from atpd.tree import command  # noqa: F401  (registers ATPD_ShowFeatureTree on import)
 
         self.appendToolbar("ATPD", ["ATPD_ShowFeatureTree"])
+        # Modeling toolbar (CDC section 3.2) - the unified extrusion is its
+        # first command; other unified modeling functions (revolve, etc.)
+        # will join it in later M4 issues.
+        self.appendToolbar("Modeling", ["ATPD_UnifiedExtrude"])
 
     def GetClassName(self):
         return "Gui::PythonWorkbench"

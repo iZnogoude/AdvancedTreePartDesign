@@ -905,6 +905,211 @@ def test_rollback_bar_via_panel_on_sweep_loft():
     assert os.path.getmtime(src) == mtime_before, "reference file must never be modified"
 
 
+def test_create_extrusion_add_and_remove_material_on_existing_body():
+    """Issue #39's step 3, Add-to-existing-body half: create_extrusion()
+    must produce a real, native PartDesign::Pad for ADD_MATERIAL and a
+    real PartDesign::Pocket for REMOVE_MATERIAL - never a custom ATPD
+    type - and both must show up identically in atpd.tree.model's own
+    feature list, exactly as the native tools would have produced.
+
+    Uses a temp-directory copy of 01_simple.FCStd, never the reference
+    file itself; its mtime is asserted unchanged at the end.
+    """
+    import Part
+
+    from atpd.features.extrude_model import ADD_MATERIAL, REMOVE_MATERIAL, create_extrusion
+    from atpd.tree.model import collect_body_features
+
+    src = os.path.join(_REFERENCE_FILES_DIR, "01_simple.FCStd")
+    mtime_before = os.path.getmtime(src)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        copy_path = os.path.join(tmp_dir, "01_simple_copy.FCStd")
+        shutil.copyfile(src, copy_path)
+
+        doc = App.openDocument(copy_path)
+        try:
+            body = next(obj for obj in doc.Objects if obj.TypeId == "PartDesign::Body")
+            xy_plane = next(f for f in body.Origin.OriginFeatures if f.Role == "XY_Plane")
+
+            pad_sketch = doc.addObject("Sketcher::SketchObject", "PadSketch")
+            pad_sketch.AttachmentSupport = [(xy_plane, "")]
+            pad_sketch.MapMode = "FlatFace"
+            pad_sketch.addGeometry(Part.Circle(App.Vector(0, 0, 0), App.Vector(0, 0, 1), 3), False)
+
+            pad = create_extrusion(
+                doc, body, pad_sketch, ADD_MATERIAL, 5.0, sketch=pad_sketch
+            )
+            doc.recompute()
+
+            assert pad.TypeId == "PartDesign::Pad", "must be a real, native Pad - never custom"
+            assert pad.Profile[0] is pad_sketch
+            assert pad.Length.Value == 5.0
+            assert pad in body.Group and pad_sketch in body.Group
+            assert body.Tip is pad
+            assert pad.isValid()
+
+            names_in_panel = {
+                row.name for row in _flatten(collect_body_features(body))
+            }
+            assert pad.Name in names_in_panel and pad_sketch.Name in names_in_panel, (
+                "a feature created via our dialog must appear in our own panel "
+                "exactly like one created via the native tool"
+            )
+
+            pocket_sketch = doc.addObject("Sketcher::SketchObject", "PocketSketch")
+            pocket_sketch.AttachmentSupport = [(pad, "")]
+            pocket_sketch.MapMode = "FlatFace"
+            pocket_sketch.addGeometry(
+                Part.Circle(App.Vector(0, 0, 0), App.Vector(0, 0, 1), 1), False
+            )
+            doc.recompute()
+
+            pocket = create_extrusion(
+                doc, body, pocket_sketch, REMOVE_MATERIAL, 2.0, sketch=pocket_sketch
+            )
+            doc.recompute()
+
+            assert pocket.TypeId == "PartDesign::Pocket", "must be a real, native Pocket"
+            assert body.Tip is pocket
+            assert pocket.isValid()
+        finally:
+            App.closeDocument(doc.Name)
+
+    assert os.path.getmtime(src) == mtime_before, "reference file must never be modified"
+
+
+def test_create_extrusion_new_body():
+    """Issue #39's step 3, New-body half: create_extrusion() with
+    body_is_new=True must add the feature (and its sketch) as the plain
+    first member of a brand-new Body - no rollback-bar/Tip-insertion
+    machinery involved, since there is no prior Tip to insert relative
+    to - and honor midplane via the modern SideType="Symmetric" property
+    (Midplane is deprecated in current FreeCAD, confirmed empirically).
+
+    Uses a temp-directory copy of 01_simple.FCStd, never the reference
+    file itself; its mtime is asserted unchanged at the end.
+    """
+    import Part
+
+    from atpd.features.extrude_model import ADD_MATERIAL, create_extrusion
+
+    src = os.path.join(_REFERENCE_FILES_DIR, "01_simple.FCStd")
+    mtime_before = os.path.getmtime(src)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        copy_path = os.path.join(tmp_dir, "01_simple_copy.FCStd")
+        shutil.copyfile(src, copy_path)
+
+        doc = App.openDocument(copy_path)
+        try:
+            new_body = doc.addObject("PartDesign::Body", "NewBody")
+            sketch = doc.addObject("Sketcher::SketchObject", "NewBodySketch")
+            sketch.addGeometry(Part.Circle(App.Vector(0, 0, 0), App.Vector(0, 0, 1), 4), False)
+
+            pad = create_extrusion(
+                doc,
+                new_body,
+                sketch,
+                ADD_MATERIAL,
+                8.0,
+                midplane=True,
+                body_is_new=True,
+                sketch=sketch,
+            )
+            doc.recompute()
+
+            assert pad.TypeId == "PartDesign::Pad"
+            assert new_body.Tip is pad
+            assert pad in new_body.Group and sketch in new_body.Group
+            assert pad.SideType == "Symmetric"
+            assert pad.isValid()
+        finally:
+            App.closeDocument(doc.Name)
+
+    assert os.path.getmtime(src) == mtime_before, "reference file must never be modified"
+
+
+def test_create_extrusion_rejects_remove_material_on_new_body():
+    """A brand-new Body's first feature can never remove material - there
+    is nothing yet to subtract from - so create_extrusion() must reject
+    that combination with a ValueError before touching the document."""
+    from atpd.features.extrude_model import REMOVE_MATERIAL, create_extrusion
+
+    doc = App.newDocument()
+    try:
+        body = doc.addObject("PartDesign::Body", "Body")
+        object_count_before = len(doc.Objects)
+        try:
+            create_extrusion(doc, body, None, REMOVE_MATERIAL, 1.0, body_is_new=True)
+            raise AssertionError("expected a ValueError")
+        except ValueError:
+            pass
+        assert len(doc.Objects) == object_count_before, (
+            "a rejected combination must not create any object"
+        )
+    finally:
+        App.closeDocument(doc.Name)
+
+
+def test_extrude_task_panel_widget_state():
+    """The Task Panel's widget logic - constructed directly with a given
+    profile, bypassing FreeCADGui.Selection/Gui.Control (both unavailable
+    under FreeCADCmd, confirmed empirically - not exercised by this test,
+    same limitation documented on every other Task-Panel-adjacent test in
+    this file). What *is* real here: actual PySide6 widgets, under a bare
+    offscreen QApplication (not the full FreeCAD Gui app)."""
+    from PySide6 import QtWidgets
+
+    from atpd.features.extrude_task import ExtrudeTaskPanel
+
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    doc = App.newDocument()
+    try:
+        sketch = doc.addObject("Sketcher::SketchObject", "Sketch")
+
+        panel = ExtrudeTaskPanel(sketch, sketch)
+        assert "Sketch" in panel._profile_description()
+
+        # default: existing body, add material
+        inputs = panel.gather_inputs()
+        assert inputs == {
+            "mode": "add",
+            "length": 10.0,
+            "midplane": False,
+            "body_is_new": False,
+        }
+
+        panel.remove_material_radio.setChecked(True)
+        assert panel.gather_inputs()["mode"] == "remove"
+
+        # switching to "New body" must force Add material and disable
+        # both mode radios - there is nothing yet to remove from
+        panel.new_body_radio.setChecked(True)
+        assert panel.add_material_radio.isChecked()
+        assert not panel.add_material_radio.isEnabled()
+        assert not panel.remove_material_radio.isEnabled()
+        assert panel.gather_inputs()["body_is_new"] is True
+        assert panel.gather_inputs()["mode"] == "add"
+
+        panel.length_spin.setValue(42.5)
+        panel.symmetric_check.setChecked(True)
+        inputs = panel.gather_inputs()
+        assert inputs["length"] == 42.5
+        assert inputs["midplane"] is True
+    finally:
+        App.closeDocument(doc.Name)
+
+
+def _flatten(rows):
+    out = []
+    for row in rows:
+        out.append(row)
+        out.extend(_flatten(row.children))
+    return out
+
+
 def _collect_tests():
     module = sys.modules[__name__]
     return [
