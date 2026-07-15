@@ -3,10 +3,18 @@
 Deliberately has no Qt/Gui dependency, so it can be exercised headlessly
 (FreeCADCmd, no QApplication) - see tests/run_tests.py. The Qt-facing
 panel (panel.py) is a thin consumer of collect_body_features().
+
+FreeCAD (the App module) is imported directly here, unlike everything
+else in this file which takes doc/obj/body as parameters - ParamGet()
+is a module-level App call with no object to receive it on, and it's
+still headless-safe (FreeCADCmd has it; it's FreeCADGui/Qt this module
+avoids), so this doesn't compromise the "exercised headlessly" goal.
 """
 
 import json
 from dataclasses import dataclass, field
+
+import FreeCAD as App
 
 ACTIVE = "active"
 SUPPRESSED = "suppressed"
@@ -225,24 +233,44 @@ def _apply_groups(body, top_level: list[FeatureRow]) -> list[FeatureRow]:
     return result
 
 
-def find_dependents(obj) -> list:
-    """Other document objects that reference obj, excluding its own Body.
+def _related_objects(obj, list_attr: str) -> list:
+    """Shared dedup + own-Body exclusion for the InList/OutList lookups below.
 
-    obj.InList always includes the Body (via its Group property), which
-    isn't a meaningful "this depends on obj" relationship for a suppress
-    warning, so it's filtered out. InList can also list the same object
-    more than once when it references obj through several properties
-    (e.g. both AttachmentSupport and ExternalGeometry), so results are
-    deduped, preserving order.
+    obj.InList/OutList always include the Body (via its Group property),
+    which isn't a meaningful dependency relationship for either warning
+    or highlighting purposes, so it's filtered out. Both lists can also
+    list the same object more than once when it's linked through several
+    properties (e.g. both AttachmentSupport and ExternalGeometry), so
+    results are deduped, preserving order.
     """
     seen = set()
-    dependents = []
-    for other in obj.InList:
+    related = []
+    for other in getattr(obj, list_attr):
         if other.TypeId == "PartDesign::Body" or other.Name in seen:
             continue
         seen.add(other.Name)
-        dependents.append(other)
-    return dependents
+        related.append(other)
+    return related
+
+
+def find_dependents(obj) -> list:
+    """Other document objects that reference obj (consume/depend on it).
+
+    This is obj.InList: objects pointing *to* obj. Used for the
+    suppress/delete impact warning and, as "children", for the
+    dependency-highlight feature.
+    """
+    return _related_objects(obj, "InList")
+
+
+def find_dependencies(obj) -> list:
+    """Other document objects that obj itself references (its prerequisites).
+
+    This is obj.OutList: objects obj points *to* - e.g. a Pad's Profile
+    sketch or its BaseFeature. Used as "parents" for the
+    dependency-highlight feature.
+    """
+    return _related_objects(obj, "OutList")
 
 
 def toggle_suppressed(doc, obj) -> bool:
@@ -447,3 +475,23 @@ def move_to_group(doc, obj, member_names: list[str], group_id: str | None) -> No
         else:
             membership[member] = group_id
     save_groups(doc, obj, groups, membership)
+
+
+_PREFERENCES_GROUP = "User parameter:BaseApp/Preferences/Mod/ATPD"
+_HOVER_HIGHLIGHT_PARAM = "HoverHighlightEnabled"
+
+
+def is_hover_highlight_enabled() -> bool:
+    """Whether dependency highlighting (hover/selection) is turned on.
+
+    Stored as a FreeCAD *user* preference (ParamGet), never a document
+    property: this is a personal interface setting tied to the person
+    using ATPD, not to a specific .FCStd file, and per ENF3 nothing
+    about the document format should carry it. Defaults to on (today's
+    behavior) so existing users see no change until they turn it off.
+    """
+    return App.ParamGet(_PREFERENCES_GROUP).GetBool(_HOVER_HIGHLIGHT_PARAM, True)
+
+
+def set_hover_highlight_enabled(value: bool) -> None:
+    App.ParamGet(_PREFERENCES_GROUP).SetBool(_HOVER_HIGHLIGHT_PARAM, bool(value))

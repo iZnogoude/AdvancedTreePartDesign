@@ -23,18 +23,31 @@ from .model import (
     create_group,
     delete_objects,
     dissolve_group,
+    find_dependencies,
     find_dependents,
+    is_hover_highlight_enabled,
     isolate_object,
     load_groups,
     move_to_group,
     rename_group,
     rename_label,
     restore_visibilities,
+    set_hover_highlight_enabled,
     toggle_suppressed,
 )
 
 _NAME_ROLE = QtCore.Qt.ItemDataRole.UserRole
 _IS_GROUP_ROLE = QtCore.Qt.ItemDataRole.UserRole + 1
+
+# Alpha values for the dependency-highlight background, applied to the
+# palette's own Highlight color rather than a hardcoded RGB - stays
+# theme-correct (light or dark) the same way the suppressed-row styling
+# does. Parents (what the hovered/selected feature depends on, via
+# OutList) get a lighter tint; children (what depends on it, via InList)
+# a stronger one - a "simple enough" visual distinction per the issue,
+# without inventing a second hue that might clash in some themes.
+_HIGHLIGHT_PARENT_ALPHA = 55
+_HIGHLIGHT_CHILD_ALPHA = 110
 
 
 def _active_body():
@@ -89,8 +102,16 @@ class _TreeDocumentObserver:
         self._on_change()
 
 
-def _make_item(row: FeatureRow) -> QtWidgets.QTreeWidgetItem:
-    """Build a QTreeWidgetItem for a row, recursively nesting its children."""
+def _make_item(
+    row: FeatureRow, registry: dict[str, QtWidgets.QTreeWidgetItem] | None = None
+) -> QtWidgets.QTreeWidgetItem:
+    """Build a QTreeWidgetItem for a row, recursively nesting its children.
+
+    If registry is given, every item built (including group folders) is
+    recorded under row.name - used by the dependency-highlight feature to
+    look up an arbitrary object's item in O(1) instead of re-walking the
+    tree for every parent/child on every hover.
+    """
     if row.is_group:
         item = QtWidgets.QTreeWidgetItem([row.label, row.type_id])
         item.setToolTip(0, row.label)
@@ -102,14 +123,18 @@ def _make_item(row: FeatureRow) -> QtWidgets.QTreeWidgetItem:
                 QtWidgets.QStyle.StandardPixmap.SP_DirIcon
             ),
         )
+        if registry is not None:
+            registry[row.name] = item
         for child in row.children:
-            item.addChild(_make_item(child))
+            item.addChild(_make_item(child, registry))
         return item
 
     item = QtWidgets.QTreeWidgetItem([row.label, row.type_id])
     item.setToolTip(0, row.label)
     item.setToolTip(1, row.type_id)
     item.setData(0, _NAME_ROLE, row.name)
+    if registry is not None:
+        registry[row.name] = item
     # Qt.ItemIsEditable is per-item, not per-column - it also technically
     # makes the Type column editable. _on_item_changed() below only ever
     # acts on column 0, so editing column 1 is a harmless no-op that the
@@ -139,7 +164,7 @@ def _make_item(row: FeatureRow) -> QtWidgets.QTreeWidgetItem:
         item.setIcon(0, icon)
 
     for child in row.children:
-        item.addChild(_make_item(child))
+        item.addChild(_make_item(child, registry))
     return item
 
 
@@ -158,7 +183,30 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
         super().__init__("ATPD - Feature Tree", parent)
         self.setObjectName("ATPD_FeatureTreePanel")
 
-        self._tree = QtWidgets.QTreeWidget(self)
+        container = QtWidgets.QWidget(self)
+        layout = QtWidgets.QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        header = QtWidgets.QToolBar(container)
+        header.setObjectName("ATPD_FeatureTreeHeaderToolbar")
+        header.setIconSize(QtCore.QSize(16, 16))
+        header.setMovable(False)
+        header.setFloatable(False)
+        layout.addWidget(header)
+
+        self._hover_highlight_action = self._add_persisted_toggle(
+            header,
+            QtWidgets.QApplication.style().standardIcon(
+                QtWidgets.QStyle.StandardPixmap.SP_FileDialogInfoView
+            ),
+            "Highlight dependencies on hover/selection",
+            is_hover_highlight_enabled,
+            set_hover_highlight_enabled,
+            on_toggled=self._on_hover_highlight_toggled,
+        )
+
+        self._tree = QtWidgets.QTreeWidget(container)
         self._tree.setColumnCount(2)
         self._tree.setHeaderLabels(["Feature", "Type"])
         # Explicit, not relying on Qt's default: Ctrl/Shift-click multi-select
@@ -179,7 +227,17 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
             | QtWidgets.QAbstractItemView.EditTrigger.SelectedClicked
         )
         self._tree.itemChanged.connect(self._on_item_changed)
-        self.setWidget(self._tree)
+        # itemEntered only fires with mouse tracking on - it's off by
+        # default since most QTreeWidget uses don't need per-item hover.
+        self._tree.setMouseTracking(True)
+        self._tree.itemEntered.connect(self._on_item_hover)
+        self._tree.itemSelectionChanged.connect(self._on_selection_changed)
+        # No itemLeft signal in Qt - catch the mouse leaving the viewport
+        # entirely (as opposed to moving to a different item, which just
+        # fires itemEntered again) via an event filter instead.
+        self._tree.viewport().installEventFilter(self)
+        layout.addWidget(self._tree)
+        self.setWidget(container)
 
         self._observer = _TreeDocumentObserver(self.refresh)
         Gui.addDocumentObserver(self._observer)
@@ -189,6 +247,16 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
         # body had right before that, so a second click can undo it.
         self._isolated_name: str | None = None
         self._isolated_saved_visibility: dict[str, bool] = {}
+
+        # Dependency-highlight state: name -> item for O(1) lookup, the
+        # currently-highlighted items (to clear on the next hover/
+        # selection change), and which name the *selection* (as opposed
+        # to a transient hover) is highlighting, so a hover that ends
+        # reverts to showing the selection's highlight rather than
+        # clearing it outright.
+        self._items_by_name: dict[str, QtWidgets.QTreeWidgetItem] = {}
+        self._highlighted_items: list[QtWidgets.QTreeWidgetItem] = []
+        self._selected_highlight_name: str | None = None
 
         App.Console.PrintMessage("ATPD tree DEBUG: panel __init__, running initial refresh()\n")
         self.refresh()
@@ -202,6 +270,10 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
         self._tree.blockSignals(True)
         try:
             self._tree.clear()
+            # Old items are gone (clear() deletes them) - drop every
+            # reference to them so nothing stale lingers.
+            self._items_by_name = {}
+            self._highlighted_items = []
             body = _active_body()
             if body is None:
                 App.Console.PrintMessage(
@@ -214,7 +286,7 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
                 f"{count_rows(rows)} total (incl. nested) from body {body.Name}\n"
             )
             for row in rows:
-                self._tree.addTopLevelItem(_make_item(row))
+                self._tree.addTopLevelItem(_make_item(row, self._items_by_name))
             self._tree.expandAll()
             self._tree.resizeColumnToContents(0)
             self._tree.resizeColumnToContents(1)
@@ -224,6 +296,120 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
     def closeEvent(self, event: QtCore.QEvent) -> None:
         Gui.removeDocumentObserver(self._observer)
         super().closeEvent(event)
+
+    def _add_persisted_toggle(
+        self,
+        toolbar: QtWidgets.QToolBar,
+        icon: QtGui.QIcon,
+        tooltip: str,
+        get_value,
+        set_value,
+        on_toggled=None,
+    ) -> QtGui.QAction:
+        """Add a checkable header-toolbar action backed by a persisted
+        (non-document) FreeCAD user preference.
+
+        This is the pattern to follow for any future header button that
+        needs a remembered on/off state: write get/set functions in
+        model.py (see is_hover_highlight_enabled/set_hover_highlight_enabled)
+        and call this once with them - loading the saved state, wiring
+        persistence, and optionally reacting to the change are all
+        handled here instead of being copy-pasted per button.
+        """
+        action = toolbar.addAction(icon, tooltip)
+        action.setCheckable(True)
+        action.setChecked(get_value())
+
+        def handle_toggled(checked: bool) -> None:
+            set_value(checked)
+            if on_toggled is not None:
+                on_toggled(checked)
+
+        action.toggled.connect(handle_toggled)
+        return action
+
+    def _on_hover_highlight_toggled(self, checked: bool) -> None:
+        App.Console.PrintMessage(f"ATPD tree DEBUG: hover highlight enabled -> {checked}\n")
+        # _apply_highlight() itself gates on the action's checked state
+        # and always clears first, so this one call correctly handles
+        # both directions: turning it off wipes any current highlight,
+        # turning it back on immediately re-shows the selection's.
+        self._apply_highlight(self._selected_highlight_name if checked else None)
+
+    def eventFilter(self, watched, event: QtCore.QEvent) -> bool:
+        if watched is self._tree.viewport() and event.type() == QtCore.QEvent.Type.Leave:
+            # Mouse left the tree entirely - revert to the selection's
+            # highlight (if any) rather than leaving the last-hovered
+            # item's highlight stuck on.
+            self._apply_highlight(self._selected_highlight_name)
+        return super().eventFilter(watched, event)
+
+    def _on_item_hover(self, item: QtWidgets.QTreeWidgetItem, column: int) -> None:
+        if item.data(0, _IS_GROUP_ROLE):
+            return
+        self._apply_highlight(item.data(0, _NAME_ROLE))
+
+    def _on_selection_changed(self) -> None:
+        selected = self._tree.selectedItems()
+        if len(selected) == 1 and not selected[0].data(0, _IS_GROUP_ROLE):
+            self._selected_highlight_name = selected[0].data(0, _NAME_ROLE)
+        else:
+            self._selected_highlight_name = None
+        self._apply_highlight(self._selected_highlight_name)
+
+    def _highlight_color(self, alpha: int) -> QtGui.QColor:
+        """A tint of the palette's own Highlight color, not a hardcoded
+        RGB - stays correct in both light and dark themes."""
+        color = QtGui.QColor(
+            QtWidgets.QApplication.palette().color(QtGui.QPalette.ColorRole.Highlight)
+        )
+        color.setAlpha(alpha)
+        return color
+
+    def _apply_highlight(self, name: str | None) -> None:
+        """Background-highlight name's parents (OutList) and children
+        (InList), on top of whatever suppressed/error foreground styling
+        is already on those rows - setBackground()/setForeground() are
+        independent, so neither overwrites the other.
+
+        Single gate point for the header toolbar's on/off toggle: every
+        caller (hover, selection change, hover-leave reverting to the
+        selection) goes through here, so checking
+        self._hover_highlight_action once is enough - no need to guard
+        each call site separately.
+        """
+        self._clear_highlight()
+        if not name or not self._hover_highlight_action.isChecked():
+            return
+        doc = App.ActiveDocument
+        if doc is None:
+            return
+        obj = doc.getObject(name)
+        if obj is None:
+            return
+
+        parent_color = self._highlight_color(_HIGHLIGHT_PARENT_ALPHA)
+        for parent in find_dependencies(obj):
+            self._set_item_background(parent.Name, parent_color)
+
+        child_color = self._highlight_color(_HIGHLIGHT_CHILD_ALPHA)
+        for child in find_dependents(obj):
+            self._set_item_background(child.Name, child_color)
+
+    def _set_item_background(self, name: str, color: QtGui.QColor) -> None:
+        item = self._items_by_name.get(name)
+        if item is None:
+            return
+        for column in (0, 1):
+            item.setBackground(column, color)
+        self._highlighted_items.append(item)
+
+    def _clear_highlight(self) -> None:
+        empty_brush = QtGui.QBrush()
+        for item in self._highlighted_items:
+            for column in (0, 1):
+                item.setBackground(column, empty_brush)
+        self._highlighted_items = []
 
     def _resolve_object(self, item: QtWidgets.QTreeWidgetItem):
         """The live FreeCAD object an item represents, or None."""
