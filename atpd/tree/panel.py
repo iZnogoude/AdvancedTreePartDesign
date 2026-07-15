@@ -126,7 +126,7 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
     """Dockable view of the active Body's feature chain.
 
     Read-only display plus a few interactions:
-    - double-click a feature to suppress/unsuppress it
+    - double-click a feature to edit it (same as the context menu's Edit)
     - F2, or clicking an already-selected feature, to rename it inline
     - right-click for the full menu: Suppress/Unsuppress, Edit, Delete,
       Delete with Children, Go to Sketch (only if the feature has one),
@@ -146,7 +146,10 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
         # EditKeyPressed = F2. SelectedClicked = clicking an item that is
         # already selected, same convention native file explorers use for
         # rename - deliberately *not* DoubleClicked, which already means
-        # suppress/unsuppress here (see _on_item_double_clicked).
+        # Edit here (see _on_item_double_clicked), matching both the
+        # native tree and file-explorer conventions: a fast double-click
+        # opens/edits, a slow second click on an already-selected item
+        # renames.
         self._tree.setEditTriggers(
             QtWidgets.QAbstractItemView.EditTrigger.EditKeyPressed
             | QtWidgets.QAbstractItemView.EditTrigger.SelectedClicked
@@ -207,7 +210,12 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
         return doc.getObject(name)
 
     def _on_item_double_clicked(self, item: QtWidgets.QTreeWidgetItem, column: int) -> None:
-        self._try_toggle_suppress(item)
+        """Fast double-click means Edit - Suppress/Unsuppress is context-menu only."""
+        obj = self._resolve_object(item)
+        if obj is None:
+            App.Console.PrintMessage("ATPD tree DEBUG: double-click on an unresolved item\n")
+            return
+        self._edit_object(obj)
 
     def _find_sketch_child(
         self, item: QtWidgets.QTreeWidgetItem
@@ -266,15 +274,6 @@ class FeatureTreePanel(QtWidgets.QDockWidget):
             self._goto_sketch(sketch_child)
         elif chosen is isolate_action:
             self._toggle_isolate(obj)
-
-    def _try_toggle_suppress(self, item: QtWidgets.QTreeWidgetItem) -> None:
-        obj = self._resolve_object(item)
-        if obj is None or not hasattr(obj, "Suppressed"):
-            App.Console.PrintMessage(
-                "ATPD tree DEBUG: double-click on a non-suppressible item, ignored\n"
-            )
-            return
-        self._toggle_suppress(obj)
 
     def _toggle_suppress(self, obj) -> None:
         """Suppress/unsuppress obj, warning about dependents first if any."""
