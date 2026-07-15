@@ -416,7 +416,7 @@ def test_dependency_highlight():
     test in this file relying on __init__ never being reachable
     headlessly at all).
     """
-    from PySide6 import QtCore, QtWidgets
+    from PySide6 import QtCore, QtGui, QtWidgets
 
     from atpd.tree.model import collect_body_features
     from atpd.tree.panel import (
@@ -439,6 +439,15 @@ def test_dependency_highlight():
         panel._selected_highlight_name = None
         for row in rows:
             _make_item(row, panel._items_by_name)
+
+        # _apply_highlight() gates on the header toggle's checked state
+        # (see test_header_toggle_persists_and_gates_highlighting for
+        # that behavior itself) - stand in a plain checked QAction here
+        # since this test is only about the highlight set, not the
+        # toggle.
+        panel._hover_highlight_action = QtGui.QAction()
+        panel._hover_highlight_action.setCheckable(True)
+        panel._hover_highlight_action.setChecked(True)
 
         # Pad001: consumed by Pad002 (child, via InList) via its edges;
         # itself consumes Sketch001 (Profile) and Pad (BaseFeature) as
@@ -468,6 +477,82 @@ def test_dependency_highlight():
             assert style == QtCore.Qt.BrushStyle.NoBrush, f"{name} still highlighted after clear"
     finally:
         App.closeDocument(doc.Name)
+
+
+def test_header_toggle_persists_and_gates_highlighting():
+    """The header toolbar's hover-highlight toggle must:
+    - load its initial checked state from the persisted user preference
+    - persist every change back to that preference (via ParamGet, a
+      *user* setting - never touches the document)
+    - immediately gate _apply_highlight(): off clears any current
+      highlight and suppresses new ones, back on re-shows the selection
+
+    Restores the preference's original value at the end - this is a
+    real FreeCAD user preference (shared with the actual installation,
+    not something scoped to a temp file), so leaving it flipped would be
+    a real side effect on whoever runs this suite.
+    """
+    from PySide6 import QtWidgets
+
+    from atpd.tree.model import (
+        collect_body_features,
+        is_hover_highlight_enabled,
+        set_hover_highlight_enabled,
+    )
+    from atpd.tree.panel import FeatureTreePanel, _make_item
+
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    original = is_hover_highlight_enabled()
+    try:
+        doc = App.openDocument(os.path.join(_REFERENCE_FILES_DIR, "03_cross_deps.FCStd"))
+        try:
+            body = next(obj for obj in doc.Objects if obj.TypeId == "PartDesign::Body")
+            rows = collect_body_features(body)
+
+            panel = FeatureTreePanel.__new__(FeatureTreePanel)
+            panel._items_by_name = {}
+            panel._highlighted_items = []
+            panel._selected_highlight_name = None
+            for row in rows:
+                _make_item(row, panel._items_by_name)
+
+            toolbar = QtWidgets.QToolBar()
+            icon = QtWidgets.QApplication.style().standardIcon(
+                QtWidgets.QStyle.StandardPixmap.SP_FileDialogInfoView
+            )
+            panel._hover_highlight_action = panel._add_persisted_toggle(
+                toolbar,
+                icon,
+                "Highlight dependencies on hover/selection",
+                is_hover_highlight_enabled,
+                set_hover_highlight_enabled,
+                on_toggled=panel._on_hover_highlight_toggled,
+            )
+            assert panel._hover_highlight_action.isChecked() == original, (
+                "initial checked state must match the persisted preference"
+            )
+
+            panel._selected_highlight_name = "Pad001"
+            panel._apply_highlight("Pad001")
+            assert len(panel._highlighted_items) == 3
+
+            panel._hover_highlight_action.setChecked(False)
+            assert is_hover_highlight_enabled() is False, "toggle-off must persist"
+            assert panel._highlighted_items == [], "toggle-off must clear the current highlight"
+
+            panel._apply_highlight("Pad001")
+            assert panel._highlighted_items == [], "must not highlight anything while toggled off"
+
+            panel._hover_highlight_action.setChecked(True)
+            assert is_hover_highlight_enabled() is True, "toggle-on must persist"
+            assert len(panel._highlighted_items) == 3, (
+                "toggle-on must re-show the selection's highlight immediately"
+            )
+        finally:
+            App.closeDocument(doc.Name)
+    finally:
+        set_hover_highlight_enabled(original)
 
 
 def _collect_tests():

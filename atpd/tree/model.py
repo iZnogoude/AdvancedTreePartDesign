@@ -3,10 +3,18 @@
 Deliberately has no Qt/Gui dependency, so it can be exercised headlessly
 (FreeCADCmd, no QApplication) - see tests/run_tests.py. The Qt-facing
 panel (panel.py) is a thin consumer of collect_body_features().
+
+FreeCAD (the App module) is imported directly here, unlike everything
+else in this file which takes doc/obj/body as parameters - ParamGet()
+is a module-level App call with no object to receive it on, and it's
+still headless-safe (FreeCADCmd has it; it's FreeCADGui/Qt this module
+avoids), so this doesn't compromise the "exercised headlessly" goal.
 """
 
 import json
 from dataclasses import dataclass, field
+
+import FreeCAD as App
 
 ACTIVE = "active"
 SUPPRESSED = "suppressed"
@@ -467,3 +475,23 @@ def move_to_group(doc, obj, member_names: list[str], group_id: str | None) -> No
         else:
             membership[member] = group_id
     save_groups(doc, obj, groups, membership)
+
+
+_PREFERENCES_GROUP = "User parameter:BaseApp/Preferences/Mod/ATPD"
+_HOVER_HIGHLIGHT_PARAM = "HoverHighlightEnabled"
+
+
+def is_hover_highlight_enabled() -> bool:
+    """Whether dependency highlighting (hover/selection) is turned on.
+
+    Stored as a FreeCAD *user* preference (ParamGet), never a document
+    property: this is a personal interface setting tied to the person
+    using ATPD, not to a specific .FCStd file, and per ENF3 nothing
+    about the document format should carry it. Defaults to on (today's
+    behavior) so existing users see no change until they turn it off.
+    """
+    return App.ParamGet(_PREFERENCES_GROUP).GetBool(_HOVER_HIGHLIGHT_PARAM, True)
+
+
+def set_hover_highlight_enabled(value: bool) -> None:
+    App.ParamGet(_PREFERENCES_GROUP).SetBool(_HOVER_HIGHLIGHT_PARAM, bool(value))
